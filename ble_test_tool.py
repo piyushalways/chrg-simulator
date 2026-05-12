@@ -109,7 +109,15 @@ CHAR_DIS_HW_REV         = "00002a27-0000-1000-8000-00805f9b34fb"
 CHAR_DIS_MANUFACTURER   = "00002a29-0000-1000-8000-00805f9b34fb"
 
 DEVICE_NAME       = "DUSQ_CHARGER"
-AUTH_PIN          = bytes([0x00, 0x00, 0x00])
+AUTH_PIN_LEN      = 3
+# Per-device PIN = low 24 bits of CRC32(UICR-backed Serial Number).
+# See src/ble_svc.c auth_init().  Use compute_auth_pin() to derive it from
+# the 16-byte serial read from DIS Serial Number (0x2A25).
+
+def compute_auth_pin(serial_bytes: bytes) -> bytes:
+    """Compute the 3-byte Auth PIN for a device given its 16-byte DIS Serial Number."""
+    full = zlib.crc32(serial_bytes) & 0xFFFFFFFF
+    return (full & 0xFFFFFF).to_bytes(3, "big")
 
 # Flash block geometry (must match firmware src/flash.h)
 BLOCK_SIZE          = 152      # full block: 32 B header + 30 × 4 B readings
@@ -666,12 +674,19 @@ class AuthTab(ttk.Frame):
         frm.pack(fill="x", padx=6, pady=6)
 
         ttk.Label(frm, text="PIN (hex, 3 bytes):").grid(row=0, column=0, sticky="w")
-        self.pin_var = tk.StringVar(value="00 00 00")
+        self.pin_var = tk.StringVar(value="")
         ttk.Entry(frm, textvariable=self.pin_var, width=14).grid(row=0, column=1, padx=4)
-        ttk.Button(frm, text="Authenticate", command=self._do_auth).grid(row=0, column=2, padx=4)
+        ttk.Button(frm, text="Compute from serial",
+                   command=self._compute_pin).grid(row=0, column=2, padx=4)
+        ttk.Button(frm, text="Authenticate",
+                   command=self._do_auth).grid(row=0, column=3, padx=4)
+
+        ttk.Label(frm,
+                  text="PIN = low 24 bits of CRC32(DIS Serial). Empty → auto-compute on Authenticate.",
+                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 4))
 
         self.result_lbl = ttk.Label(frm, text="Status: not authenticated", foreground="gray")
-        self.result_lbl.grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+        self.result_lbl.grid(row=2, column=0, columnspan=4, sticky="w", pady=4)
 
         lf = ttk.LabelFrame(self, text="Log", padding=4)
         lf.pack(fill="both", expand=True, padx=6, pady=4)
@@ -694,77 +709,119 @@ class AuthTab(ttk.Frame):
                                    foreground="gray")
         self._log("Disconnected — auth state cleared.")
 
+    def _compute_pin(self):
+        """Read DIS Serial Number from the device and fill the PIN field with
+        the matching auto-derived PIN (low 24 bits of CRC32 of the serial).
+        Provided so the user can see the computed value before hitting
+        Authenticate, and still hand-edit it for fault-injection testing."""
+        if not self.ble.connected:
+            messagebox.showwarning("Compute PIN", "Not connected.")
+            return
+
+        async def _read():
+            try:
+                serial = bytes(await self.ble.read(CHAR_DIS_SERIAL))
+                pin = compute_auth_pin(serial)
+                self.pin_var.set(pin.hex(" ").upper())
+                self._log(f"Read DIS Serial = {serial.decode('ascii', 'replace')!r}")
+                self._log(f"Computed PIN = {pin.hex(' ').upper()}")
+            except Exception as e:
+                self._log(f"Compute-PIN error: {e}")
+                messagebox.showerror("Compute PIN", str(e))
+        run_async(_read())
+
     def _do_auth(self):
         if not self.ble.connected:
             messagebox.showwarning("Auth", "Not connected.")
             return
-        try:
-            raw = bytes(int(b, 16) for b in self.pin_var.get().split())
-        except ValueError:
-            messagebox.showerror("Auth", "Invalid PIN — enter 3 hex bytes e.g. '00 00 00'")
+
+        pin_text = self.pin_var.get().strip()
+        if not pin_text:
+            # Empty field → auto-compute from DIS Serial Number, then write.
+            async def _autoauth():
+                try:
+                    serial = bytes(await self.ble.read(CHAR_DIS_SERIAL))
+                    pin = compute_auth_pin(serial)
+                    self.pin_var.set(pin.hex(" ").upper())
+                    self._log(f"Auto-derived PIN from serial "
+                              f"{serial.decode('ascii', 'replace')!r}: "
+                              f"{pin.hex(' ').upper()}")
+                    await self._send_pin_and_verify(pin)
+                except Exception as e:
+                    self.result_lbl.configure(text="Status: error during auth",
+                                              foreground="red")
+                    self._log(f"Auth error: {e}")
+            run_async(_autoauth())
             return
 
-        async def _auth():
-            """Auth verification via STATUS char only.
+        try:
+            raw = bytes(int(b, 16) for b in pin_text.split())
+        except ValueError:
+            messagebox.showerror("Auth",
+                                 "Invalid PIN — enter 3 hex bytes (e.g. '1A B3 7F') "
+                                 "or leave empty to auto-compute from serial.")
+            return
 
-            The firmware does NOT notify back on the auth char (0x1524) —
-            see src/ble_svc.c:373-465. The ONLY way for the host to know
-            whether authentication succeeded is to read the Status char
-            (0x1529) afterwards and check the `state` field. state == 4
-            (AUTHENTICATED) is the device's own state-machine truth.
-            """
-            try:
-                self._log(f"Writing PIN {raw.hex(' ')} to {CHAR_AUTH_PIN} …")
-                self.result_lbl.configure(text="Status: writing PIN…",
-                                            foreground="gray")
+        run_async(self._send_pin_and_verify(raw))
 
-                # 1. Send the PIN.
-                await self.ble.write(CHAR_AUTH_PIN, raw)
+    async def _send_pin_and_verify(self, pin: bytes):
+        """Send the PIN to the firmware and verify success via the Status char.
 
-                # 2. Trigger any external observers (e.g. BatteryTab
-                #    auto-subscribe) so they kick off as soon as the PIN
-                #    write returns successfully.
-                if callable(self.on_auth_attempt):
-                    try:
-                        self.on_auth_attempt()
-                    except Exception as cb_err:
-                        self._log(f"Auth callback error: {cb_err}")
+        The firmware does NOT notify back on the auth char (0x1524) — see
+        src/ble_svc.c on_write().  Status char (0x1529) is the device's own
+        state-machine truth: state == AUTHENTICATED confirms PIN accepted.
+        """
+        try:
+            self._log(f"Writing PIN {pin.hex(' ').upper()} to {CHAR_AUTH_PIN} …")
+            self.result_lbl.configure(text="Status: writing PIN…",
+                                        foreground="gray")
 
-                # 3. Give the firmware a moment to flip its state machine.
-                await asyncio.sleep(0.7)
+            # 1. Send the PIN.
+            await self.ble.write(CHAR_AUTH_PIN, pin)
 
-                # 4. Read STATUS char and check the device's view.
-                status_raw = await self.ble.read(CHAR_STATUS)
-                s = decode_status(bytes(status_raw))
-                state = s.get("state", "?")
-                self._log(f"Status char read: state={state}  full={s}")
+            # 2. Trigger any external observers (e.g. BatteryTab
+            #    auto-subscribe) so they kick off as soon as the PIN
+            #    write returns successfully.
+            if callable(self.on_auth_attempt):
+                try:
+                    self.on_auth_attempt()
+                except Exception as cb_err:
+                    self._log(f"Auth callback error: {cb_err}")
 
-                if state == "AUTHENTICATED":
-                    self.authenticated = True
-                    self.result_lbl.configure(
-                        text="Status: AUTHENTICATED",
-                        foreground="green")
-                    self._log("Authentication successful "
-                              "(verified via Status char 0x1529).")
-                elif state == "CONNECTED":
-                    self.authenticated = False
-                    self.result_lbl.configure(
-                        text="Status: REJECTED — wrong PIN",
-                        foreground="red")
-                    self._log("Authentication rejected — device stayed "
-                              "in CONNECTED state.")
-                else:
-                    self.authenticated = False
-                    self.result_lbl.configure(
-                        text=f"Status: unexpected state = {state}",
-                        foreground="darkorange")
-                    self._log(f"Unexpected device state after auth: {state}")
-            except Exception as e:
+            # 3. Give the firmware a moment to flip its state machine.
+            await asyncio.sleep(0.7)
+
+            # 4. Read STATUS char and check the device's view.
+            status_raw = await self.ble.read(CHAR_STATUS)
+            s = decode_status(bytes(status_raw))
+            state = s.get("state", "?")
+            self._log(f"Status char read: state={state}  full={s}")
+
+            if state == "AUTHENTICATED":
+                self.authenticated = True
                 self.result_lbl.configure(
-                    text="Status: error during auth",
+                    text="Status: AUTHENTICATED",
+                    foreground="green")
+                self._log("Authentication successful "
+                          "(verified via Status char 0x1529).")
+            elif state == "CONNECTED":
+                self.authenticated = False
+                self.result_lbl.configure(
+                    text="Status: REJECTED — wrong PIN",
                     foreground="red")
-                self._log(f"Auth error: {e}")
-        run_async(_auth())
+                self._log("Authentication rejected — device stayed "
+                          "in CONNECTED state.")
+            else:
+                self.authenticated = False
+                self.result_lbl.configure(
+                    text=f"Status: unexpected state = {state}",
+                    foreground="darkorange")
+                self._log(f"Unexpected device state after auth: {state}")
+        except Exception as e:
+            self.result_lbl.configure(
+                text="Status: error during auth",
+                foreground="red")
+            self._log(f"Auth error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2248,16 +2305,22 @@ class ValidationTab(ttk.Frame):
 
     async def _t_B1(self, ctx):
         try:
-            await self.ble.write(CHAR_AUTH_PIN, bytes([0, 0, 0]))
+            serial = bytes(await self.ble.read(CHAR_DIS_SERIAL))
+            pin = compute_auth_pin(serial)
+            await self.ble.write(CHAR_AUTH_PIN, pin)
             await asyncio.sleep(1.0)
             raw = await self.ble.read(CHAR_STATUS)
             stat = decode_status(raw)
             if stat.get("state") == "AUTHENTICATED":
                 return self._mk("B1", "PASS", "PIN accepted",
-                                 [f"status state = {stat['state']}"])
+                                 [f"serial = {serial.decode('ascii', 'replace')}",
+                                  f"pin = {pin.hex(' ').upper()}",
+                                  f"status state = {stat['state']}"])
             return self._mk("B1", "FAIL",
                              f"state did not flip to AUTHENTICATED",
-                             [f"observed state = {stat.get('state')}"])
+                             [f"serial = {serial.decode('ascii', 'replace')}",
+                              f"pin = {pin.hex(' ').upper()}",
+                              f"observed state = {stat.get('state')}"])
         except Exception as e:
             return self._mk("B1", "FAIL", f"auth flow error: {e}")
 
@@ -3510,6 +3573,308 @@ class DeviceInfoTab(ttk.Frame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Adv Data tab — continuously scans and decodes the MSD payload (no connect)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Manufacturer Specific Data layout (firmware: src/ble_svc.c build_manuf_data)
+#   [0]      sys_state (bits 0-3) | flags (bits 4-7: USB / boost / lid / auth)
+#   [1]      battery % (0..100, 0xFF if not yet read)
+#   [2-3]    unsynced block count, uint16 LE
+#   [4-5]    journal entry count, uint16 LE
+#   [6-9]    last sync Unix epoch, uint32 LE (0 = never since boot)
+ADV_MSD_COMPANY_ID = 0xFFFF
+ADV_MSD_LEN        = 10
+ADV_STATE_NAMES = [
+    "INIT", "SLOW_ADV", "FAST_ADV", "CONNECTED",
+    "AUTHENTICATED", "FLASH_TX", "ERROR",
+]
+
+
+def decode_dusq_msd(payload):
+    """Decode the 10-byte DUSQ MSD payload (without company ID).
+    Returns dict, or None if payload is missing / too short."""
+    if not payload or len(payload) < ADV_MSD_LEN:
+        return None
+    state_id = payload[0] & 0x0F
+    return {
+        "state_id":   state_id,
+        "state":      ADV_STATE_NAMES[state_id] if state_id < len(ADV_STATE_NAMES) else f"?({state_id})",
+        "usb":        bool(payload[0] & 0x10),
+        "charging":   bool(payload[0] & 0x20),
+        "lid_closed": bool(payload[0] & 0x40),
+        "authed":     bool(payload[0] & 0x80),
+        "batt_pct":   payload[1] if payload[1] != 0xFF else None,
+        "blocks":     int.from_bytes(payload[2:4], "little"),
+        "journal":    int.from_bytes(payload[4:6], "little"),
+        "last_sync":  int.from_bytes(payload[6:10], "little"),
+    }
+
+
+class AdvTab(ttk.Frame):
+    """Continuously scans for DUSQ_CHARGER devices and decodes the MSD payload
+    from every advertisement. No connection is opened — purely passive.
+
+    Filter: device name must contain "DUSQ_CHARGER" (case-insensitive).
+    Company ID 0xFFFF alone is too loose (other dev devices use it too)."""
+
+    REFRESH_MS = 500   # period for "Seen N s ago" refresh
+
+    def __init__(self, parent, ble: BLEManager):
+        super().__init__(parent)
+        self.ble = ble
+        self._scanner = None
+        self._scanning = False
+        self._devices = {}   # addr -> {'rssi', 'raw', 'decoded', 'seen'}
+
+        # --- Controls -------------------------------------------------------
+        ctrl = ttk.Frame(self)
+        ctrl.pack(fill="x", padx=6, pady=6)
+        self.scan_btn = ttk.Button(ctrl, text="▶ Start scanning",
+                                    command=self._toggle_scan)
+        self.scan_btn.pack(side="left")
+        ttk.Button(ctrl, text="Clear", command=self._clear
+                  ).pack(side="left", padx=6)
+        self.status_var = tk.StringVar(value="Idle. Press Start scanning to begin.")
+        ttk.Label(ctrl, textvariable=self.status_var,
+                  foreground="gray").pack(side="left", padx=10)
+
+        # --- Device table ---------------------------------------------------
+        cols = ("address", "rssi", "state", "usb", "charging", "lid", "auth",
+                "batt", "blocks", "journal", "last_sync", "seen")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings",
+                                  selectmode="browse", height=14)
+        for col, label, width in [
+            ("address",   "MAC",          170),
+            ("rssi",      "RSSI",         60),
+            ("state",     "State",        110),
+            ("usb",       "USB",          50),
+            ("charging",  "Charging",     70),
+            ("lid",       "Lid",          60),
+            ("auth",      "Auth",         50),
+            ("batt",      "Batt %",       60),
+            ("blocks",    "Blocks",       60),
+            ("journal",   "Journal",      60),
+            ("last_sync", "Last sync",    140),
+            ("seen",      "Seen (s ago)", 80),
+        ]:
+            self.tree.heading(col, text=label)
+            self.tree.column(col, width=width, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=6, pady=4)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # --- Raw bytes for selected row ------------------------------------
+        raw_frm = ttk.LabelFrame(self, text="Raw MSD (selected row)", padding=6)
+        raw_frm.pack(fill="x", padx=6, pady=(0, 6))
+        self.raw_var = tk.StringVar(value="(select a row above)")
+        ttk.Label(raw_frm, textvariable=self.raw_var,
+                  font=("Courier", 9)).pack(anchor="w")
+
+        # --- Manual MSD decoder --------------------------------------------
+        dec_frm = ttk.LabelFrame(
+            self, text="Manual decoder (paste hex bytes from any tool)", padding=6)
+        dec_frm.pack(fill="x", padx=6, pady=(0, 6))
+
+        ttk.Label(dec_frm, text="Hex (with or without 0xFFFF company ID prefix):",
+                  foreground="gray").pack(anchor="w")
+        self.dec_input_var = tk.StringVar()
+        ent = ttk.Entry(dec_frm, textvariable=self.dec_input_var,
+                        font=("Courier", 9))
+        ent.pack(fill="x", pady=2)
+        ent.bind("<Return>", lambda _e: self._do_manual_decode())
+        btn_row = ttk.Frame(dec_frm)
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="Decode",
+                   command=self._do_manual_decode).pack(side="left", pady=2)
+        ttk.Label(btn_row,
+                  text="(accepts '02 2D 00 …', '0x02 0x2D …', 'FFFF022D…', etc.)",
+                  foreground="gray").pack(side="left", padx=8)
+        self.dec_output_var = tk.StringVar(
+            value="(paste hex bytes above and click Decode)")
+        ttk.Label(dec_frm, textvariable=self.dec_output_var,
+                  font=("Courier", 9), justify="left",
+                  anchor="w").pack(fill="x", pady=(4, 0))
+
+        # Periodic redraw for "Seen N s ago" so silent devices visibly age
+        self.after(self.REFRESH_MS, self._redraw_periodic)
+
+    # ------------------------------------------------------------------ public
+    def stop(self):
+        """Called on app close — shut down the scanner cleanly."""
+        if self._scanning:
+            self._scanning = False
+            if self._scanner:
+                run_async(self._scanner.stop())
+
+    # ---------------------------------------------------------------- internal
+    def _toggle_scan(self):
+        if self._scanning:
+            self._stop_scan()
+        else:
+            self._start_scan()
+
+    def _start_scan(self):
+        self._scanning = True
+        self.scan_btn.configure(text="■ Stop scanning")
+        self.status_var.set("Scanning… (passive, no connection)")
+        run_async(self._scan_loop())
+
+    def _stop_scan(self):
+        self._scanning = False
+        self.scan_btn.configure(text="▶ Start scanning")
+        self.status_var.set("Stopped.")
+        if self._scanner:
+            run_async(self._scanner.stop())
+
+    async def _scan_loop(self):
+        try:
+            self._scanner = BleakScanner(detection_callback=self._on_adv)
+            await self._scanner.start()
+            while self._scanning:
+                await asyncio.sleep(0.5)
+            await self._scanner.stop()
+        except Exception as e:
+            self.status_var.set(f"Scan error: {e}")
+            self._scanning = False
+            self.scan_btn.configure(text="▶ Start scanning")
+
+    def _on_adv(self, device, adv):
+        # Filter: must be DUSQ_CHARGER by name. Company ID 0xFFFF alone is too
+        # loose because every dev/test device uses it.
+        name = (device.name or adv.local_name or "").strip()
+        if DEVICE_NAME.lower() not in name.lower():
+            return
+        mfd = adv.manufacturer_data or {}
+        payload = mfd.get(ADV_MSD_COMPANY_ID)
+        decoded = decode_dusq_msd(payload) if payload else None
+        self._devices[device.address] = {
+            "rssi":    adv.rssi if adv.rssi is not None else -999,
+            "raw":     bytes(payload) if payload else b"",
+            "decoded": decoded,
+            "seen":    datetime.now(),
+        }
+        self.after(0, self._refresh_tree)
+
+    def _refresh_tree(self):
+        # Preserve selection across rebuild
+        sel = self.tree.selection()
+        selected_addr = self.tree.item(sel[0], "values")[0] if sel else None
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        now = datetime.now()
+        for addr, info in sorted(self._devices.items(),
+                                  key=lambda kv: kv[1]["rssi"], reverse=True):
+            d = info["decoded"]
+            secs_ago = int((now - info["seen"]).total_seconds())
+            if d:
+                last_sync_disp = ("never" if d["last_sync"] == 0
+                                   else datetime.fromtimestamp(d["last_sync"])
+                                        .strftime("%Y-%m-%d %H:%M:%S"))
+                values = (
+                    addr,
+                    f"{info['rssi']} dBm",
+                    d["state"],
+                    "yes" if d["usb"] else "no",
+                    "yes" if d["charging"] else "no",
+                    "closed" if d["lid_closed"] else "open",
+                    "yes" if d["authed"] else "no",
+                    "—" if d["batt_pct"] is None else f"{d['batt_pct']}",
+                    d["blocks"],
+                    d["journal"],
+                    last_sync_disp,
+                    f"{secs_ago}s",
+                )
+            else:
+                # DUSQ device without MSD (old firmware?)
+                values = (addr, f"{info['rssi']} dBm", "—", "—", "—", "—", "—",
+                          "—", "—", "—", "—", f"{secs_ago}s")
+            iid = self.tree.insert("", "end", values=values)
+            if addr == selected_addr:
+                self.tree.selection_set(iid)
+
+    def _redraw_periodic(self):
+        if self._devices:
+            self._refresh_tree()
+        self.after(self.REFRESH_MS, self._redraw_periodic)
+
+    def _on_select(self, _evt):
+        sel = self.tree.selection()
+        if not sel:
+            self.raw_var.set("(select a row above)")
+            return
+        addr = self.tree.item(sel[0], "values")[0]
+        info = self._devices.get(addr)
+        if not info or not info["raw"]:
+            self.raw_var.set(f"[{addr}]  (no MSD in this device's adv)")
+            return
+        company = ADV_MSD_COMPANY_ID.to_bytes(2, "little")
+        full = company + info["raw"]
+        hex_str = " ".join(f"{b:02X}" for b in full)
+        self.raw_var.set(f"[{addr}]  {hex_str}")
+
+    def _clear(self):
+        self._devices.clear()
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        self.raw_var.set("(select a row above)")
+
+    def _do_manual_decode(self):
+        """Parse a hex string the user pasted (any common format) and show
+        the decoded MSD fields."""
+        raw = self.dec_input_var.get()
+        # Strip "0x"/"0X" prefixes FIRST (their '0' would otherwise be kept and
+        # shift byte alignment), then filter to hex digits only.
+        no_prefix = raw.replace("0x", "").replace("0X", "")
+        cleaned = "".join(ch for ch in no_prefix.lower()
+                          if ch in "0123456789abcdef")
+        if len(cleaned) % 2 != 0:
+            self.dec_output_var.set(f"Error: odd number of hex digits ({len(cleaned)})")
+            return
+        try:
+            data = bytes.fromhex(cleaned)
+        except ValueError as e:
+            self.dec_output_var.set(f"Error: invalid hex — {e}")
+            return
+
+        # Strip optional 0xFFFF company-ID prefix (2 bytes, little-endian)
+        if len(data) >= ADV_MSD_LEN + 2 and data[0:2] == b"\xFF\xFF":
+            payload = data[2:2 + ADV_MSD_LEN]
+            had_company_id = True
+        elif len(data) >= ADV_MSD_LEN:
+            payload = data[:ADV_MSD_LEN]
+            had_company_id = False
+        else:
+            self.dec_output_var.set(
+                f"Error: need at least {ADV_MSD_LEN} bytes payload "
+                f"(or {ADV_MSD_LEN + 2} with FFFF prefix); got {len(data)}")
+            return
+
+        d = decode_dusq_msd(payload)
+        if d is None:
+            self.dec_output_var.set("Error: decode failed")
+            return
+
+        last_sync_disp = ("never" if d["last_sync"] == 0
+                           else datetime.fromtimestamp(d["last_sync"])
+                                .strftime("%Y-%m-%d %H:%M:%S"))
+        batt_disp = "unknown" if d["batt_pct"] is None else f"{d['batt_pct']}%"
+        hex_str = " ".join(f"{b:02X}" for b in payload)
+        prefix_note = "" if had_company_id else "  (no FFFF prefix detected — assumed payload-only)"
+        text = (
+            f"Bytes (10): {hex_str}{prefix_note}\n"
+            f"  State:         {d['state']} (0x{d['state_id']:X})\n"
+            f"  USB:           {'connected' if d['usb'] else 'disconnected'}\n"
+            f"  Charging:      {'yes' if d['charging'] else 'no'}\n"
+            f"  Lid:           {'closed' if d['lid_closed'] else 'open'}\n"
+            f"  Authenticated: {'yes' if d['authed'] else 'no'}\n"
+            f"  Battery:       {batt_disp}\n"
+            f"  Blocks:        {d['blocks']}\n"
+            f"  Journal:       {d['journal']}\n"
+            f"  Last sync:     {last_sync_disp}"
+        )
+        self.dec_output_var.set(text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Main application
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3562,6 +3927,7 @@ class App(tk.Tk):
         nb.pack(fill="both", expand=True, padx=4, pady=4)
 
         self.conn_tab    = ConnectionTab(nb, self.ble, self.status_var)
+        self.adv_tab     = AdvTab(nb, self.ble)
         self.auth_tab    = AuthTab(nb, self.ble)
         self.devinfo_tab = DeviceInfoTab(nb, self.ble)
         self.sens_tab    = SensorTab(nb, self.ble)
@@ -3592,6 +3958,7 @@ class App(tk.Tk):
         # Tab order: workflow steps first, comprehensive validation,
         # then the activity log as the last tab.
         nb.add(self.conn_tab,    text="Connect")
+        nb.add(self.adv_tab,     text="Adv Data")
         nb.add(self.auth_tab,    text="Auth")
         nb.add(self.devinfo_tab, text="Device Info")
         nb.add(self.sens_tab,    text="Sensors")
@@ -3684,6 +4051,7 @@ class App(tk.Tk):
         self.after(20, self._poll_loop)
 
     def _on_close(self):
+        self.adv_tab.stop()   # shut down passive scanner cleanly
         async def _cleanup():
             await self.ble.disconnect()
         self.loop.run_until_complete(_cleanup())
