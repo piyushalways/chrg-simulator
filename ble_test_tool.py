@@ -91,10 +91,11 @@ CHAR_JOURNAL_START   = _uuid(0x1536)   # Write — 0x01 starts journal transfer
 
 # Haptic Motor Service (0x152F)
 SVC_HAPTIC        = _uuid(0x152F)
-CHAR_HAPTIC_CTL   = _uuid(0x1530)   # Write — 0x01=ON, else OFF
-CHAR_HAPTIC_INT   = _uuid(0x1531)   # Read+Write — duty 0-100%
-CHAR_HAPTIC_TIMER = _uuid(0x1532)   # Write — uint32 LE countdown seconds
-CHAR_HAPTIC_STAT  = _uuid(0x1533)   # Read+Notify — 0=idle,1=buzzing,2=countdown
+CHAR_HAPTIC_CTL      = _uuid(0x1530)   # Write — 0x01=ON, else OFF
+CHAR_HAPTIC_INT      = _uuid(0x1531)   # Read+Write — duty 0-100%
+CHAR_HAPTIC_TIMER    = _uuid(0x1532)   # Write — uint32 LE countdown seconds
+CHAR_HAPTIC_STAT     = _uuid(0x1533)   # Read+Notify — 0=idle,1=buzzing,2=countdown
+CHAR_HAPTIC_REMINDER = _uuid(0x1537)   # Read+Write — 5B: [0] enable, [1..4] recurring_s LE
 
 # Battery Service (SIG standard)
 SVC_BATT          = "0000180f-0000-1000-8000-00805f9b34fb"
@@ -102,6 +103,7 @@ CHAR_BATT_LEVEL   = "00002a19-0000-1000-8000-00805f9b34fb"
 
 # Device Information Service (SIG standard) — 5 chars exposed by firmware
 SVC_DIS                 = "0000180a-0000-1000-8000-00805f9b34fb"
+CHAR_DIS_SYSTEM_ID      = "00002a23-0000-1000-8000-00805f9b34fb"
 CHAR_DIS_MODEL          = "00002a24-0000-1000-8000-00805f9b34fb"
 CHAR_DIS_SERIAL         = "00002a25-0000-1000-8000-00805f9b34fb"
 CHAR_DIS_FW_REV         = "00002a26-0000-1000-8000-00805f9b34fb"
@@ -342,13 +344,20 @@ class BLEManager:
             except Exception as e:
                 self._log(f"disconnect sub error: {e}")
 
-    async def scan(self, timeout: float = 8.0, show_all: bool = False) -> List[dict]:
+    async def scan(self, timeout: float = 8.0, show_all: bool = False,
+                    on_update: Optional[Callable[[dict], None]] = None) -> List[dict]:
         """
         Streaming-mode scan: opens a BleakScanner and accumulates every
         advertisement that arrives during `timeout` seconds. More reliable
         than BleakScanner.discover() on Windows — that batch API occasionally
         drops legitimate adverts even when the OS Bluetooth stack receives
         them.
+
+        If `on_update` is given, it is invoked for every adv (after dedupe
+        and rssi-update) with the same result-dict shape as the final
+        return list.  The UI uses this to populate its tree live instead
+        of waiting for the timeout to elapse.  The callback runs on the
+        BLE thread — wrap UI mutations in `widget.after(0, ...)`.
 
         Every individual advertisement is logged to the EventLog ("scan_adv")
         so you can confirm in real time whether bleak is actually seeing
@@ -362,11 +371,38 @@ class BLEManager:
         self._log(f"Scanning for {timeout} s … (streaming, all devices)")
         self._evt("scan", f"start: timeout={timeout}s (streaming)")
 
+        target_uuid = SVC_AUTH.lower()
         discovered: Dict[str, Tuple[Any, Any]] = {}
+
+        def _make_entry(dev, adv) -> dict:
+            name = dev.name or adv.local_name or ""
+            adv_uuids = [u.lower() for u in (adv.service_uuids or [])]
+            is_target = (
+                (bool(name) and DEVICE_NAME.lower() in name.lower())
+                or (target_uuid in adv_uuids)
+            )
+            display_name = name
+            if not display_name:
+                if adv.manufacturer_data:
+                    mfr_id, mfr_bytes = next(iter(adv.manufacturer_data.items()))
+                    display_name = f"<mfr 0x{mfr_id:04X}: {mfr_bytes[:4].hex()}…>"
+                elif adv.service_uuids:
+                    display_name = f"<svc {adv.service_uuids[0][:8]}…>"
+                else:
+                    display_name = "<no name>"
+            return {
+                "name":    display_name,
+                "address": dev.address,
+                "rssi":    adv.rssi if adv.rssi is not None else -999,
+                "tag":     " [TARGET]" if is_target else "",
+                "device":  dev,
+            }
 
         def _on_adv(device, adv):
             # Fires for EVERY advertisement received, including duplicates.
-            # We dedupe by address but log each hit for visibility.
+            # We dedupe by address but log each hit for visibility, and
+            # push a live update to the UI on every hit so the tree
+            # reflects current RSSI rather than first-seen RSSI.
             try:
                 addr = device.address
             except Exception:
@@ -379,6 +415,11 @@ class BLEManager:
                        f"name='{name or '<none>'}'  "
                        f"svc={short_uuids[0][:8] if short_uuids else '-'}")
             discovered[addr] = (device, adv)
+            if on_update is not None:
+                try:
+                    on_update(_make_entry(device, adv))
+                except Exception as cb_err:
+                    self._evt("error", f"scan on_update callback failed: {cb_err}")
 
         try:
             scanner = BleakScanner(detection_callback=_on_adv)
@@ -392,33 +433,7 @@ class BLEManager:
             self._log(f"Scan failed: {e}")
             raise
 
-        results = []
-        target_uuid = SVC_AUTH.lower()
-        for addr, (dev, adv) in discovered.items():
-            name = dev.name or adv.local_name or ""
-            adv_uuids = [u.lower() for u in (adv.service_uuids or [])]
-            is_target = (
-                (bool(name) and DEVICE_NAME.lower() in name.lower())
-                or (target_uuid in adv_uuids)
-            )
-
-            display_name = name
-            if not display_name:
-                if adv.manufacturer_data:
-                    mfr_id, mfr_bytes = next(iter(adv.manufacturer_data.items()))
-                    display_name = f"<mfr 0x{mfr_id:04X}: {mfr_bytes[:4].hex()}…>"
-                elif adv.service_uuids:
-                    display_name = f"<svc {adv.service_uuids[0][:8]}…>"
-                else:
-                    display_name = "<no name>"
-
-            results.append({
-                "name":    display_name,
-                "address": addr,
-                "rssi":    adv.rssi if adv.rssi is not None else -999,
-                "tag":     " [TARGET]" if is_target else "",
-                "device":  dev,
-            })
+        results = [_make_entry(dev, adv) for dev, adv in discovered.values()]
         results.sort(key=lambda d: d["rssi"], reverse=True)
         targets = sum(1 for d in results if d["tag"])
         self._log(f"Found {len(results)} device(s) (streaming, no filter).")
@@ -582,18 +597,65 @@ class ConnectionTab(ttk.Frame):
         self.scan_btn.configure(state="disabled")
         for row in self.tree.get_children():
             self.tree.delete(row)
+        self.devices = []                       # cache fills live below
+        self._device_index: Dict[str, int] = {} # addr -> index in self.devices
+
+        def _on_update(entry: dict):
+            # Runs on the BLE thread.  Hop to the Tk main thread to mutate
+            # the tree, and update self.devices in place so the existing
+            # _refresh_tree_from_cache() / connect path still works.
+            self.after(0, lambda e=entry: self._upsert_device(e))
+
         async def _scan():
             try:
                 # BLEManager.scan returns every advertiser; we cache the full
                 # list and filter at display time so the user can flip
                 # "Show all (debug)" without re-scanning.
                 devs = await self.ble.scan(self.timeout_var.get(),
-                                            self.show_all.get())
+                                            self.show_all.get(),
+                                            on_update=_on_update)
+                # Final reconciliation at end-of-scan: dev list is the source
+                # of truth, and sorting is reapplied.
                 self.devices = devs
+                self._device_index = {d["address"]: i for i, d in enumerate(self.devices)}
                 self._refresh_tree_from_cache()
             finally:
                 self.scan_btn.configure(state="normal")
         run_async(_scan())
+
+    def _upsert_device(self, entry: dict):
+        """Insert or update a device row as adverts arrive — Tk main thread."""
+        addr = entry["address"]
+        is_target = bool(entry["tag"])
+        # Skip non-targets unless the user has flipped "Show all".
+        if not is_target and not self.show_all.get():
+            return
+        idx = self._device_index.get(addr)
+        if idx is None:
+            self.devices.append(entry)
+            self._device_index[addr] = len(self.devices) - 1
+        else:
+            self.devices[idx] = entry
+        # Find an existing tree row for this address; update in place if found,
+        # otherwise insert a new one.
+        for row_id in self.tree.get_children():
+            if self.tree.item(row_id, "values")[1] == addr:
+                row_tags = ("target",) if is_target else ()
+                self.tree.item(row_id,
+                               values=(entry["name"], addr, entry["rssi"], entry["tag"]),
+                               tags=row_tags)
+                break
+        else:
+            row_tags = ("target",) if is_target else ()
+            self.tree.insert("", "end",
+                              values=(entry["name"], addr,
+                                      entry["rssi"], entry["tag"]),
+                              tags=row_tags)
+        targets = sum(1 for d in self.devices if d["tag"])
+        self.scan_count_var.set(
+            f"Total seen: {len(self.devices)}  ·  "
+            f"targets shown: {targets}"
+            + ("  (showing all)" if self.show_all.get() else ""))
 
     def _refresh_tree_from_cache(self):
         """Re-populate the device tree from self.devices applying the current
@@ -2981,6 +3043,31 @@ class HapticTab(ttk.Frame):
         ttk.Button(frm, text="Subscribe Status",
                    command=self._sub_status).grid(row=3, column=2, padx=4)
 
+        # ── Recurring reminder (0x1537) ──────────────────────────────────────
+        rem = ttk.LabelFrame(self, text="Recurring Reminder (0x1537)", padding=10)
+        rem.pack(fill="x", padx=6, pady=6)
+
+        ttk.Label(rem,
+                  text="Sets the post-buzz rescheduling rule. Bootstrap the chain by also writing a countdown above.",
+                  foreground="gray", wraplength=520
+                 ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+
+        ttk.Label(rem, text="Recurring (s):").grid(row=1, column=0, sticky="w")
+        self.rem_interval_var = tk.IntVar(value=86400)
+        ttk.Entry(rem, textvariable=self.rem_interval_var, width=10
+                 ).grid(row=1, column=1, padx=4)
+        ttk.Button(rem, text="Arm",
+                   command=lambda: self._set_reminder(True)).grid(row=1, column=2, padx=4)
+        ttk.Button(rem, text="Disable",
+                   command=lambda: self._set_reminder(False)).grid(row=1, column=3, padx=4)
+        ttk.Button(rem, text="Read Current",
+                   command=self._read_reminder).grid(row=1, column=4, padx=4)
+
+        ttk.Label(rem, text="Current rule:").grid(row=2, column=0, sticky="w", pady=4)
+        self.rem_state_var = tk.StringVar(value="(unknown — click Read Current)")
+        ttk.Label(rem, textvariable=self.rem_state_var,
+                  font=("Courier", 10)).grid(row=2, column=1, columnspan=4, sticky="w")
+
         lf = ttk.LabelFrame(self, text="Log", padding=4)
         lf.pack(fill="both", expand=True, padx=6, pady=4)
         self.log_box = scrolledtext.ScrolledText(lf, height=12, state="disabled",
@@ -3038,6 +3125,52 @@ class HapticTab(ttk.Frame):
             except Exception as e:
                 self._log(f"Error: {e}")
         run_async(_s())
+
+    def _set_reminder(self, enable: bool):
+        """Write the 5-byte Recurring Reminder rule (0x1537).
+
+        Wire format: [enable: u8] [recurring_s: u32 LE]
+        Firmware rejects enable=1 with recurring=0. Manual buzzes do not chain
+        — the phone must also write a countdown (0x1532) to bootstrap. """
+        if not self.ble.connected: return
+        interval = max(0, self.rem_interval_var.get())
+        if enable and interval <= 0:
+            messagebox.showerror("Reminder",
+                                 "Recurring interval must be > 0 when arming.")
+            return
+        payload = bytes([1 if enable else 0]) + struct.pack("<I", interval if enable else 0)
+        async def _w():
+            try:
+                await self.ble.write(CHAR_HAPTIC_REMINDER, payload)
+                if enable:
+                    self._log(f"Reminder ARMED: recurring={interval} s "
+                              f"({payload.hex(' ').upper()})")
+                    self._log("Now write a Countdown above to bootstrap the chain.")
+                else:
+                    self._log("Reminder DISABLED.")
+                self.rem_state_var.set(
+                    f"enable={int(enable)}  recurring={interval if enable else 0} s")
+            except Exception as e:
+                self._log(f"Reminder write error: {e}")
+        run_async(_w())
+
+    def _read_reminder(self):
+        """Read the current 5-byte reminder rule (post-reboot reflects persisted state)."""
+        if not self.ble.connected: return
+        async def _r():
+            try:
+                raw = bytes(await self.ble.read(CHAR_HAPTIC_REMINDER))
+                if len(raw) < 5:
+                    self._log(f"Reminder read: short ({len(raw)} bytes): {raw.hex(' ')}")
+                    return
+                enable = raw[0]
+                recurring_s = struct.unpack("<I", raw[1:5])[0]
+                state = f"enable={enable}  recurring={recurring_s} s"
+                self.rem_state_var.set(state)
+                self._log(f"Reminder read: {raw.hex(' ').upper()}  →  {state}")
+            except Exception as e:
+                self._log(f"Reminder read error: {e}")
+        run_async(_r())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3482,24 +3615,46 @@ class LogTab(ttk.Frame):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class DeviceInfoTab(ttk.Frame):
-    """Displays the 5 BLE Device Information Service characteristics that the
+    """Displays the BLE Device Information Service characteristics that the
     firmware exposes:
-       Manufacturer / Model / HW Rev / FW Rev / Serial Number.
+       Manufacturer / Model / HW Rev / FW Rev / Serial Number (UICR) / System ID (FICR).
 
     Read once on connect (auto), and on demand via the Read Now button.
-    Serial Number is unique per chip (FICR.DEVICEID) — useful for backend
-    binding to a user account."""
+
+    Two identity sources are exposed:
+      - Serial Number (0x2A25)   ←  UICR.CUSTOMER[0..3]  (written at factory,
+                                    customer-facing, e.g. "DUSQ2620A0000001")
+      - System ID    (0x2A23)   ←  FICR.DEVICEID + Nordic OUI (immutable chip
+                                    identity, anti-tamper anchor)"""
 
     PLACEHOLDER = "—"
 
-    # Display order: most identifying first
+    # Display order: identity at top, revision/model after.
+    # 4th tuple element is a decoder callback (bytes → display string); when
+    # None, raw bytes are decoded as UTF-8 (the default for DIS strings).
     _FIELDS = [
-        ("Manufacturer:",   "manufacturer", CHAR_DIS_MANUFACTURER),
-        ("Model:",          "model",        CHAR_DIS_MODEL),
-        ("Hardware Rev:",   "hw_rev",       CHAR_DIS_HW_REV),
-        ("Firmware Rev:",   "fw_rev",       CHAR_DIS_FW_REV),
-        ("Serial Number:",  "serial",       CHAR_DIS_SERIAL),
+        ("Manufacturer:",        "manufacturer", CHAR_DIS_MANUFACTURER, None),
+        ("Model:",               "model",        CHAR_DIS_MODEL,        None),
+        ("Hardware Rev:",        "hw_rev",       CHAR_DIS_HW_REV,       None),
+        ("Firmware Rev:",        "fw_rev",       CHAR_DIS_FW_REV,       None),
+        ("Serial Number (UICR):", "serial",      CHAR_DIS_SERIAL,       None),
+        ("System ID (FICR):",    "system_id",    CHAR_DIS_SYSTEM_ID,    "_decode_system_id"),
     ]
+
+    @staticmethod
+    def _decode_system_id(raw: bytes) -> str:
+        """Decode the 8-byte SIG-standard System ID payload.
+            bytes 0..4  = 5 LSBs of manufacturer_id (= low 5 bytes of FICR.DEVICEID, little-endian)
+            bytes 5..7  = 3-byte organizationally_unique_id (Nordic OUI 0x00149F)"""
+        if len(raw) < 8:
+            return f"<short read: {raw.hex(' ').upper()}>"
+        mfg_bytes = raw[0:5]
+        oui_bytes = raw[5:8]
+        # Reassemble the original 64-bit manufacturer_id (only low 5 bytes used)
+        mfg_id = int.from_bytes(mfg_bytes, "little")
+        oui    = int.from_bytes(oui_bytes, "little")
+        return (f"mfg=0x{mfg_id:010X}  oui=0x{oui:06X}"
+                f"  ({raw.hex(' ').upper()})")
 
     def __init__(self, parent, ble: BLEManager):
         super().__init__(parent)
@@ -3510,8 +3665,8 @@ class DeviceInfoTab(ttk.Frame):
 
         # One Label + StringVar-driven value Label per field, in a 2-column grid.
         self._vars: Dict[str, tk.StringVar] = {}
-        for row, (label, key, _) in enumerate(self._FIELDS):
-            ttk.Label(frm, text=label, width=15, anchor="w"
+        for row, (label, key, _uuid, _dec) in enumerate(self._FIELDS):
+            ttk.Label(frm, text=label, width=22, anchor="w"
                      ).grid(row=row, column=0, sticky="w", pady=2)
             var = tk.StringVar(value=self.PLACEHOLDER)
             self._vars[key] = var
@@ -3550,10 +3705,14 @@ class DeviceInfoTab(ttk.Frame):
     async def _read_all_async(self):
         self.status_lbl.configure(text="Reading…", foreground="gray")
         ok_count = 0
-        for _, key, uuid in self._FIELDS:
+        for _, key, uuid, decoder in self._FIELDS:
             try:
-                raw = await self.ble.read(uuid)
-                self._vars[key].set(raw.decode("utf-8", errors="replace").strip())
+                raw = bytes(await self.ble.read(uuid))
+                if decoder is None:
+                    self._vars[key].set(raw.decode("utf-8", errors="replace").strip())
+                else:
+                    fn = getattr(self, decoder)
+                    self._vars[key].set(fn(raw))
                 ok_count += 1
             except Exception as e:
                 self._vars[key].set(f"<error: {e}>")
@@ -3738,14 +3897,25 @@ class AdvTab(ttk.Frame):
             self.scan_btn.configure(text="▶ Start scanning")
 
     def _on_adv(self, device, adv):
-        # Filter: must be DUSQ_CHARGER by name. Company ID 0xFFFF alone is too
-        # loose because every dev/test device uses it.
+        # Filter: accept either by name OR by a valid DUSQ MSD decode.
+        #
+        # Most adv packets on Windows arrive without a name field — the name
+        # lives in the scan response, which only comes through on active
+        # scans, and BleakScanner defaults to passive on this OS.  Name-only
+        # filtering caused this tab to take 5-30 s (or never) to find a
+        # device that the Connect tab sees on the first packet.
+        #
+        # decode_dusq_msd() returning non-None is a strong filter — random
+        # devices using company ID 0xFFFF will fail the decode.
         name = (device.name or adv.local_name or "").strip()
-        if DEVICE_NAME.lower() not in name.lower():
-            return
         mfd = adv.manufacturer_data or {}
         payload = mfd.get(ADV_MSD_COMPANY_ID)
         decoded = decode_dusq_msd(payload) if payload else None
+
+        name_match = bool(name) and DEVICE_NAME.lower() in name.lower()
+        msd_match  = decoded is not None
+        if not (name_match or msd_match):
+            return
         self._devices[device.address] = {
             "rssi":    adv.rssi if adv.rssi is not None else -999,
             "raw":     bytes(payload) if payload else b"",
