@@ -519,206 +519,6 @@ def run_async(coro):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Connection tab
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ConnectionTab(ttk.Frame):
-    def __init__(self, parent, ble: BLEManager, status_var: tk.StringVar):
-        super().__init__(parent)
-        self.ble = ble
-        self.status_var = status_var
-        self.devices: List[dict] = []
-        self.ble.log_cb = self._log
-        self.ble.on_disconnect_cb = self._on_disconnected
-
-        # Scan controls
-        frm = ttk.LabelFrame(self, text="Scan", padding=5)
-        frm.pack(fill="x", padx=6, pady=5)
-        self.scan_btn = ttk.Button(frm, text="Scan", command=self._do_scan)
-        self.scan_btn.pack(side="left", padx=4)
-        ttk.Label(frm, text="Timeout (s):").pack(side="left")
-        # Default 12 s — slow adv interval is 2 s, so this catches ~6 packets
-        # even on a flaky link.
-        self.timeout_var = tk.IntVar(value=12)
-        ttk.Spinbox(frm, from_=3, to=60, textvariable=self.timeout_var,
-                    width=4).pack(side="left", padx=4)
-        # By default the device list shows ONLY targets (matching DUSQ_CHARGER
-        # name or the Auth Service UUID). Tick "Show all" for diagnostics
-        # when the target isn't appearing.
-        self.show_all = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Show all (debug)",
-                        variable=self.show_all,
-                        command=self._refresh_tree_from_cache).pack(side="left", padx=8)
-        self.scan_count_var = tk.StringVar(
-            value="Total seen: 0  ·  targets shown: 0")
-        ttk.Label(frm, textvariable=self.scan_count_var,
-                  font=("Segoe UI", 9, "italic"),
-                  foreground="#444444").pack(side="left", padx=12)
-
-        # Device list
-        lf = ttk.LabelFrame(self, text="Discovered Devices", padding=5)
-        lf.pack(fill="both", expand=True, padx=6, pady=2)
-        cols = ("name", "address", "rssi", "tag")
-        self.tree = ttk.Treeview(lf, columns=cols, show="headings", height=6)
-        for c, w, label in [("name", 160, "Name"), ("address", 180, "Address"),
-                              ("rssi", 60, "RSSI"), ("tag", 80, "")]:
-            self.tree.heading(c, text=label)
-            self.tree.column(c, width=w)
-        # Greenish highlight (#8FA97A) for rows that match either DUSQ_CHARGER
-        # by name OR carry the Auth Service UUID in their advertisement —
-        # makes our device pop out of a long unfiltered scan list.
-        self.tree.tag_configure("target", background="#8FA97A",
-                                 foreground="black")
-        self.tree.pack(fill="both", expand=True)
-        # Double-click a row to connect immediately
-        self.tree.bind("<Double-1>", self._on_row_double_click)
-
-        # Connect / disconnect
-        cf = ttk.Frame(self)
-        cf.pack(fill="x", padx=6, pady=4)
-        self.conn_btn = ttk.Button(cf, text="Connect", command=self._do_connect)
-        self.conn_btn.pack(side="left", padx=4)
-        ttk.Button(cf, text="Disconnect", command=self._do_disconnect).pack(side="left", padx=4)
-
-        # Log
-        lf2 = ttk.LabelFrame(self, text="Log", padding=4)
-        lf2.pack(fill="both", expand=True, padx=6, pady=4)
-        self.log_box = scrolledtext.ScrolledText(lf2, height=10, state="disabled",
-                                                  font=("Courier", 9))
-        self.log_box.pack(fill="both", expand=True)
-
-    def _log(self, msg: str):
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", f"[{ts()}] {msg}\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
-
-    def _do_scan(self):
-        self.scan_btn.configure(state="disabled")
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-        self.devices = []                       # cache fills live below
-        self._device_index: Dict[str, int] = {} # addr -> index in self.devices
-
-        def _on_update(entry: dict):
-            # Runs on the BLE thread.  Hop to the Tk main thread to mutate
-            # the tree, and update self.devices in place so the existing
-            # _refresh_tree_from_cache() / connect path still works.
-            self.after(0, lambda e=entry: self._upsert_device(e))
-
-        async def _scan():
-            try:
-                # BLEManager.scan returns every advertiser; we cache the full
-                # list and filter at display time so the user can flip
-                # "Show all (debug)" without re-scanning.
-                devs = await self.ble.scan(self.timeout_var.get(),
-                                            self.show_all.get(),
-                                            on_update=_on_update)
-                # Final reconciliation at end-of-scan: dev list is the source
-                # of truth, and sorting is reapplied.
-                self.devices = devs
-                self._device_index = {d["address"]: i for i, d in enumerate(self.devices)}
-                self._refresh_tree_from_cache()
-            finally:
-                self.scan_btn.configure(state="normal")
-        run_async(_scan())
-
-    def _upsert_device(self, entry: dict):
-        """Insert or update a device row as adverts arrive — Tk main thread."""
-        addr = entry["address"]
-        is_target = bool(entry["tag"])
-        # Skip non-targets unless the user has flipped "Show all".
-        if not is_target and not self.show_all.get():
-            return
-        idx = self._device_index.get(addr)
-        if idx is None:
-            self.devices.append(entry)
-            self._device_index[addr] = len(self.devices) - 1
-        else:
-            self.devices[idx] = entry
-        # Find an existing tree row for this address; update in place if found,
-        # otherwise insert a new one.
-        for row_id in self.tree.get_children():
-            if self.tree.item(row_id, "values")[1] == addr:
-                row_tags = ("target",) if is_target else ()
-                self.tree.item(row_id,
-                               values=(entry["name"], addr, entry["rssi"], entry["tag"]),
-                               tags=row_tags)
-                break
-        else:
-            row_tags = ("target",) if is_target else ()
-            self.tree.insert("", "end",
-                              values=(entry["name"], addr,
-                                      entry["rssi"], entry["tag"]),
-                              tags=row_tags)
-        targets = sum(1 for d in self.devices if d["tag"])
-        self.scan_count_var.set(
-            f"Total seen: {len(self.devices)}  ·  "
-            f"targets shown: {targets}"
-            + ("  (showing all)" if self.show_all.get() else ""))
-
-    def _refresh_tree_from_cache(self):
-        """Re-populate the device tree from self.devices applying the current
-        filter (targets-only by default; everything when 'Show all' is on)."""
-        for row in self.tree.get_children():
-            self.tree.delete(row)
-        targets = [d for d in self.devices if d["tag"]]
-        rows = self.devices if self.show_all.get() else targets
-        for d in rows:
-            row_tags = ("target",) if d["tag"] else ()
-            self.tree.insert("", "end",
-                              values=(d["name"], d["address"],
-                                      d["rssi"], d["tag"]),
-                              tags=row_tags)
-        self.scan_count_var.set(
-            f"Total seen: {len(self.devices)}  ·  "
-            f"targets shown: {len(targets)}"
-            + ("  (showing all)" if self.show_all.get() else ""))
-
-    def _do_connect(self):
-        sel = self.tree.selection()
-        if not sel:
-            messagebox.showwarning("Connect", "Select a device first.")
-            return
-        # Look up by ADDRESS from the selected row, not by row index — the tree
-        # may be filtered (targets only) while self.devices is the full list,
-        # so row index ≠ devices index.
-        row_values = self.tree.item(sel[0], "values")
-        addr = row_values[1] if len(row_values) > 1 else None
-        entry = next((d for d in self.devices if d["address"] == addr), None)
-        if entry is None:
-            messagebox.showerror("Connect",
-                                  f"Could not find selected device {addr} in scan results.")
-            return
-        dev  = entry["device"]
-        name = entry["name"]
-        async def _connect():
-            self.status_var.set(f"Connecting to {name}…")
-            try:
-                await self.ble.connect(dev)
-                self.status_var.set(f"Connected: {name}")
-                self._log("Ready — authenticate via Auth tab.")
-            except Exception as e:
-                self._log(f"Connect failed: {e}")
-                self.status_var.set("Not connected")
-        run_async(_connect())
-
-    def _do_disconnect(self):
-        run_async(self.ble.disconnect())
-
-    def _on_row_double_click(self, _evt):
-        """Treeview Double-1 binding — connect to whichever row was clicked."""
-        sel = self.tree.selection()
-        if not sel:
-            return
-        self._do_connect()
-
-    def _on_disconnected(self):
-        self.status_var.set("Not connected")
-        self._log("Connection lost.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 #  Auth tab
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -738,20 +538,26 @@ class AuthTab(ttk.Frame):
         ttk.Label(frm, text="PIN (hex, 3 bytes):").grid(row=0, column=0, sticky="w")
         self.pin_var = tk.StringVar(value="")
         ttk.Entry(frm, textvariable=self.pin_var, width=14).grid(row=0, column=1, padx=4)
-        ttk.Button(frm, text="Compute from serial",
-                   command=self._compute_pin).grid(row=0, column=2, padx=4)
+        # Single Authenticate button — auto-derives PIN from DIS Serial if the
+        # entry is empty (preserves manual override for fault-injection).
         ttk.Button(frm, text="Authenticate",
-                   command=self._do_auth).grid(row=0, column=3, padx=4)
-        # Time-sync button — mirror of the one on the Flash tab so users can
-        # sync immediately after auth without navigating tabs.  Same backing
-        # logic; writes current UTC epoch to CHAR_TIMESYNC.
-        self.timesync_btn = ttk.Button(frm, text="Send Time Sync (UTC)",
-                                        command=self._do_time_sync)
-        self.timesync_btn.grid(row=0, column=4, padx=(12, 4))
+                   command=self._do_auth).grid(row=0, column=2, padx=4)
+        # Time-sync button — red when not synced (initial / after every
+        # fresh connect — the device may have lost its RTC), yellow after a
+        # successful sync write so the user sees confirmation but knows it's
+        # still a one-shot action.  tk.Button (vs ttk) for reliable bg color
+        # across Windows themes.
+        self.timesync_btn = tk.Button(frm, text="Send Time Sync (UTC)",
+                                       command=self._do_time_sync,
+                                       bg="#c0392b", fg="white",
+                                       activebackground="#a02818",
+                                       font=("Segoe UI", 9, "bold"),
+                                       relief="raised", bd=1)
+        self.timesync_btn.grid(row=0, column=3, padx=(12, 4))
 
         ttk.Label(frm,
-                  text="PIN = low 24 bits of CRC32(DIS Serial). Empty → auto-compute on Authenticate.",
-                  foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 4))
+                  text="PIN = low 24 bits of CRC32(DIS Serial). Leave empty → auto-derived from serial on Authenticate.",
+                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 4))
 
         self.result_lbl = ttk.Label(frm, text="Status: not authenticated", foreground="gray")
         self.result_lbl.grid(row=2, column=0, columnspan=4, sticky="w", pady=4)
@@ -773,13 +579,24 @@ class AuthTab(ttk.Frame):
         self.log_box.configure(state="disabled")
 
     def _on_disconnected(self):
-        """Reset auth state when the BLE link drops so a reconnect starts
-        clean — otherwise the green 'authenticated' label persists from the
-        previous session, even though the device requires re-auth."""
+        """Reset auth + time-sync state when the BLE link drops so a reconnect
+        starts visually clean — otherwise the green 'authenticated' label and
+        the synced 'Time synced' button persist from the previous session,
+        even though the device requires re-auth + re-sync after reconnect."""
         self.authenticated = False
         self.result_lbl.configure(text="Status: not authenticated",
                                    foreground="gray")
-        self._log("Disconnected — auth state cleared.")
+        # Reset time-sync button to red / unsynced state — every fresh
+        # connection starts un-synced and the device must be re-told.
+        try:
+            self.timesync_btn.configure(
+                bg="#c0392b", fg="white",
+                activebackground="#a02818",
+                text="Send Time Sync (UTC)")
+            self.last_sync_var.set("Last sync: never")
+        except Exception:
+            pass
+        self._log("Disconnected — auth + time-sync state cleared.")
 
     def _compute_pin(self):
         """Read DIS Serial Number from the device and fill the PIN field with
@@ -909,6 +726,16 @@ class AuthTab(ttk.Frame):
                 await self.ble.write(CHAR_TIMESYNC, struct.pack("<I", epoch))
                 wall = datetime.fromtimestamp(epoch, tz=timezone.utc)
                 self.last_sync_var.set(f"Last sync: {wall:%H:%M:%S} UTC")
+                # Flip the button to yellow/synced state — sync is one-shot,
+                # the yellow is a soft "confirmed" indicator (not green so the
+                # user knows they CAN re-sync without alarm).
+                try:
+                    self.timesync_btn.configure(
+                        bg="#f1c40f", fg="black",
+                        activebackground="#d4a017",
+                        text="Time synced ✓")
+                except Exception:
+                    pass
                 self._log(f"Time sync sent: epoch={epoch} "
                           f"({wall:%Y-%m-%d %H:%M:%S} UTC)")
             except Exception as e:
@@ -927,6 +754,10 @@ class SensorTab(ttk.Frame):
     def __init__(self, parent, ble: BLEManager):
         super().__init__(parent)
         self.ble = ble
+        # Tracks whether the 3 notify chars (sensor/batt/status) are already
+        # subscribed for this connection — used by _on_tab_visible to avoid
+        # re-subscribing on every tab focus.  Reset on disconnect.
+        self._subscribed = False
 
         # Live value StringVars
         self.sv_temp     = tk.StringVar(value="--")
@@ -942,6 +773,15 @@ class SensorTab(ttk.Frame):
         self.hist_lux    : List[Optional[float]] = []
 
         self._build_ui()
+
+    def _on_tab_visible(self):
+        """Called by App._on_tab_changed when this tab becomes visible.
+        Subscribes to the 3 notify chars if connected and not already
+        subscribed.  Silently no-ops otherwise — disconnect path resets the
+        flag so the next tab visit re-subscribes."""
+        if not self.ble.connected or self._subscribed:
+            return
+        self._do_subscribe()
 
     def _build_ui(self):
         # Control bar
@@ -1024,6 +864,7 @@ class SensorTab(ttk.Frame):
     def _on_disconnected(self):
         """Wipe all live state so a fresh connection starts from zero.
         Wired up by App via BLEManager.add_disconnect_sub()."""
+        self._subscribed = False
         for lst in (self.hist_temp, self.hist_db, self.hist_lux):
             lst.clear()
         for sv in (self.sv_temp, self.sv_db, self.sv_peak_db,
@@ -1107,6 +948,7 @@ class SensorTab(ttk.Frame):
                 await self.ble.subscribe(CHAR_SENSOR_DATA, self._on_sensor)
                 await self.ble.subscribe(CHAR_BATT_LEVEL,  self._on_batt)
                 await self.ble.subscribe(CHAR_STATUS,      self._on_status)
+                self._subscribed = True
             except Exception as e:
                 messagebox.showerror("Subscribe", str(e))
         run_async(_sub())
@@ -1692,30 +1534,39 @@ class ValidationTab(ttk.Frame):
     """49 automated tests across 9 buckets. Run individually or in bulk."""
 
     BUCKET_NAMES = {
-        "A": "BLE Link",
-        "B": "Authentication",
-        "C": "Sensor pipeline",
-        "D": "Battery",
-        "E": "Haptic",
-        "F": "Flash sensor blocks + circular buffer",
-        "G": "Journal",
-        "I": "Hall (lid sensor)",
-        "U": "USB detect",
-        "H": "Long-running (opt-in, ≥4 h)",
+        "A":   "BLE Link",
+        "B":   "Authentication",
+        "C":   "Sensor pipeline",
+        "D":   "Battery",
+        "E":   "Haptic",
+        "F":   "Flash sensor blocks + circular buffer",
+        "G":   "Journal",
+        "I":   "Hall (lid sensor)",
+        "U":   "USB detect",
+        "H":   "Long-running (opt-in, ≥4 h)",
+        # New buckets — exercise the 5 s window firmware contract.
+        "W":   "Window cadence & content (5 s sampling)",
+        "BC":  "Battery cache + refresh-on-event",
+        "CAL": "Calibration validity (manual fixtures)",
+        "TM":  "Timing / health",
     }
     # User-friendly domain labels for the checkbox UI.  Maps domain code →
     # (display label, requires-physical-interaction flag).
     DOMAIN_LABELS = {
-        "A": ("BLE",        False),
-        "B": ("Auth",       False),
-        "C": ("Sensors",    False),
-        "D": ("Battery",    False),
-        "E": ("Haptic",     True),
-        "F": ("Flash",      False),
-        "G": ("Journal",    False),
-        "I": ("Hall",       True),
-        "U": ("USB detect", True),
-        "H": ("Long-running", False),
+        "A":   ("BLE",          False),
+        "B":   ("Auth",         False),
+        "C":   ("Sensors",      False),
+        "D":   ("Battery",      False),
+        "E":   ("Haptic",       True),
+        "F":   ("Flash",        False),
+        "G":   ("Journal",      False),
+        "I":   ("Hall",         True),
+        "U":   ("USB detect",   True),
+        "H":   ("Long-running", False),
+        "W":   ("Window",       True),   # W4/W5/W6 need light/temp/sound input
+        "BC":  ("Batt cache",   True),   # BC2/BC3 need hall+USB physical events
+        "CAL": ("Calibration",  True),   # all 3 need reference instruments
+        "TM":  ("Timing",       False),
     }
 
     def __init__(self, parent, ble: BLEManager):
@@ -1778,7 +1629,8 @@ class ValidationTab(ttk.Frame):
             domain_counts[s.bucket] = domain_counts.get(s.bucket, 0) + 1
         # Build checkboxes in display order: BLE, Auth, Sensors, Battery,
         # Haptic, Flash, Journal, Hall, USB detect, Long-running.
-        domain_order = ["A", "B", "C", "D", "E", "F", "G", "I", "U", "H"]
+        domain_order = ["A", "B", "C", "D", "E", "F", "G", "I", "U", "H",
+                        "W", "BC", "CAL", "TM"]
         col, row = 0, 0
         for code in domain_order:
             if code not in self.DOMAIN_LABELS:
@@ -1837,6 +1689,32 @@ class ValidationTab(ttk.Frame):
                    command=self._domains_headless_only).pack(side="left", padx=2)
         ttk.Button(run_row, text="Clear",
                    command=self._domains_clear).pack(side="left", padx=2)
+
+        # ── Live progress region (shown only during a run) ───────────────────
+        self.running_frame = ttk.LabelFrame(self, text="Running",
+                                             padding=10)
+        # NOT packed initially — _kick_off shows it; _update_result_region hides.
+        self.running_var = tk.StringVar(value="")
+        ttk.Label(self.running_frame, textvariable=self.running_var,
+                  font=("Segoe UI", 10, "bold"),
+                  foreground="#2c3e50").pack(anchor="w")
+        self.running_progress = ttk.Progressbar(self.running_frame,
+                                                  orient="horizontal",
+                                                  mode="determinate",
+                                                  length=600)
+        self.running_progress.pack(fill="x", pady=(4, 4))
+        self.running_summary_var = tk.StringVar(value="")
+        ttk.Label(self.running_frame, textvariable=self.running_summary_var,
+                  font=("Segoe UI", 9),
+                  foreground="#34495e").pack(anchor="w")
+        self.running_recent_var = tk.StringVar(value="")
+        ttk.Label(self.running_frame, textvariable=self.running_recent_var,
+                  font=("Courier", 9),
+                  foreground="#7f8c8d", justify="left").pack(anchor="w",
+                                                               pady=(4, 0))
+        # Track run start + recent results for the panel.
+        self._run_started_at: Optional[float] = None
+        self._recent_results: List[Tuple[str, str, str]] = []  # (tid, name, status)
 
         # ── Final result region (filled in after a run completes) ────────────
         self.result_frame = ttk.LabelFrame(self, text="Latest result",
@@ -1997,6 +1875,10 @@ class ValidationTab(ttk.Frame):
         "I": "Hall — lid close fires hall event + enables boost; lid open does the reverse.  Requires you to physically move a magnet.",
         "U": "USB detect — Status.usb flips True on plug-in, False on unplug.  Requires you to plug/unplug a USB cable.",
         "H": "Long-running — ≥ 4 hour wrap watcher + connection uptime stress.  Opt in only when you have time to wait.",
+        "W":   "Window — 5 s sampling-window cadence, full sensor record contents, peak_db ≥ db invariant, calibration sanity at ambient.  Some tests prompt you for a light/temp/sound action.",
+        "BC":  "Batt cache — BAS == Status batt_pct, refresh-on-event latency for hall/USB, 90 s post-USB-unplug EMA lockout, window-open SAADC guard.  Hall + USB tests are interactive.",
+        "CAL": "Calibration — lux / temp / dB validity against external reference instruments.  Requires you to enter reference readings from a luxon, thermometer, and SLM.",
+        "TM":  "Timing — no fault-handler ERR entries in journal during a 5 min observation, Status-char read latency stable across 30 probes.",
     }
 
     def _show_domain_hint(self, code: Optional[str]):
@@ -2061,9 +1943,74 @@ class ValidationTab(ttk.Frame):
             v.set(False)
         self._on_domain_toggle()
 
+    def _show_running_panel(self, total: int):
+        """Make the live-progress panel visible at the start of a run."""
+        self._run_started_at = time.time()
+        self._recent_results = []
+        self._run_total = total
+        # Pack ABOVE the result frame so the panels visually stack with
+        # running first while a run is in flight.
+        try:
+            self.running_frame.pack(fill="x", padx=6, pady=4,
+                                     before=self.result_frame)
+        except Exception:
+            self.running_frame.pack(fill="x", padx=6, pady=4)
+        self.running_progress.configure(maximum=total, value=0)
+        self.running_var.set("Starting…")
+        self.running_summary_var.set(f"0 / {total}   PASS 0   FAIL 0")
+        self.running_recent_var.set("")
+
+    def _hide_running_panel(self):
+        try:
+            self.running_frame.pack_forget()
+        except Exception:
+            pass
+
+    def _update_running_panel(self, current_tid: str,
+                              completed: int, last_result: Optional[TestResult]):
+        """Called after each test finishes — updates progress + counts + recent
+        list. Estimates ETA from per-test average so far."""
+        if not self._ctx or self._run_started_at is None:
+            return
+        results = self._ctx.results
+        passed = sum(1 for r in results.values() if r.status == "PASS")
+        failed = sum(1 for r in results.values() if r.status == "FAIL")
+        elapsed = time.time() - self._run_started_at
+        avg_per = elapsed / max(1, completed)
+        remaining = max(0, self._run_total - completed)
+        eta = avg_per * remaining
+        spec = self._spec_by_id.get(current_tid)
+        running_name = spec.name if spec else current_tid
+        self.running_var.set(f"▶ {current_tid}  {running_name}")
+        pct = int(100 * completed / max(1, self._run_total))
+        self.running_progress.configure(value=completed)
+        self.running_summary_var.set(
+            f"{completed} / {self._run_total} ({pct}%)   "
+            f"PASS {passed}   FAIL {failed}   "
+            f"elapsed {self._fmt_secs(elapsed)}   "
+            f"ETA {self._fmt_secs(eta)}")
+        if last_result is not None:
+            mark = {"PASS": "✓", "FAIL": "✗", "SKIP": "○",
+                     "INCONCLUSIVE": "?"}.get(last_result.status, "·")
+            self._recent_results.append(
+                (last_result.test_id, last_result.name[:48], mark))
+            self._recent_results = self._recent_results[-5:]
+        recent_lines = [f"  {mark} {tid:<5} {name}"
+                         for tid, name, mark in reversed(self._recent_results)]
+        self.running_recent_var.set("Last 5:\n" + "\n".join(recent_lines)
+                                      if recent_lines else "")
+
+    @staticmethod
+    def _fmt_secs(s: float) -> str:
+        s = int(max(0, s))
+        m, r = divmod(s, 60)
+        return f"{m:02d}:{r:02d}"
+
     def _update_result_region(self):
         """Repaint the big green/red final-result label after a run completes.
         Driven from _on_run_done / cancel paths."""
+        # Hide the live panel — it's only for in-flight runs.
+        self._hide_running_panel()
         if self._ctx is None or not self._ctx.results:
             self.result_var.set("(no runs yet)")
             self.result_lbl.configure(foreground="#7f8c8d")
@@ -2084,6 +2031,12 @@ class ValidationTab(ttk.Frame):
                      for tid, r in failed[:8]]
             if len(failed) > 8:
                 lines.append(f"… and {len(failed) - 8} more")
+            # Drill-down hint — clicking the failed test row in the tree
+            # below opens the existing per-test details pane with full evidence.
+            lines.append("")
+            lines.append("→ Click any failed test row in the tree below to see "
+                          "evidence (per-line ctx.detail trace + threshold "
+                          "comparison).")
             self.result_detail_var.set("\n".join(lines))
 
     def _on_run_all(self):
@@ -2260,6 +2213,9 @@ class ValidationTab(ttk.Frame):
         self.run_all_btn.configure(state="disabled")
         self.run_sel_btn.configure(state="disabled")
         self.run_bkt_btn.configure(state="disabled")
+        # Live progress panel takes over the result region for the duration
+        # of the run. Hidden again when _update_result_region fires at end.
+        self._show_running_panel(total=len(resolved))
         self._run_task = run_async(self._run(resolved))
 
     async def _run(self, ids: List[str]):
@@ -2322,6 +2278,15 @@ class ValidationTab(ttk.Frame):
                     ctx.on_detail = None
                     self._set_row_status(tid, result.status, result.duration_s)
                     self._show_details(tid)
+                    # Update the live progress panel (running test name,
+                    # counts, ETA, last-5).
+                    try:
+                        completed = sum(1 for r in ctx.results.values()
+                                         if r.status != "PENDING"
+                                         and r.status != "RUNNING")
+                        self._update_running_panel(tid, completed, result)
+                    except Exception:
+                        pass
         except asyncio.CancelledError:
             for tid in ids:
                 if tid not in ctx.results:
@@ -2571,15 +2536,51 @@ class ValidationTab(ttk.Frame):
             T("H1", "H", "Wrap watcher (4+ hours)",  self._t_H1, ("F2",), True),
             T("H2", "H", "Connection stays up",      self._t_H2, ("A2",), True),
 
-            # ── End-of-suite teardown (still in Bucket A visually) ─────────
-            # A6 lives here at the bottom of the catalogue so that during
-            # "Run All" it executes AFTER every other test. Reason: it
-            # disconnects + reconnects the BLE link, which would force
-            # downstream tests to re-authenticate. Keeping it last leaves
-            # the rest of the suite undisturbed and the device in a clean
-            # post-test state (connected, un-authed).
-            T("A6", "A", "Disconnect & reconnect cleanly (runs last)",
-                self._t_A6, ("A2",)),
+            # ── Bucket W — 5 s sampling window contract ───────────────────
+            T("W1", "W",   "Cadence — record interval within ±2 s of 60 s",
+                self._t_W1, ("B1",)),
+            T("W2", "W",   "All 3 fields populated (no sentinels) for 3 cycles",
+                self._t_W2, ("B1",)),
+            T("W3", "W",   "peak_db ≥ db every cycle",
+                self._t_W3, ("B1",)),
+            T("W4", "W",   "Lux > 100 at room-lit ambient (manual)",
+                self._t_W4, ("B1",)),
+            T("W5", "W",   "Temp within ±2 °C of reference (manual)",
+                self._t_W5, ("B1",)),
+            T("W6", "W",   "dB rises ≥ 10 dB on loud sound (manual)",
+                self._t_W6, ("B1",)),
+
+            # ── Bucket BC — battery cache & refresh-on-event ──────────────
+            T("BC1", "BC", "BAS char matches Status batt_pct (cache parity)",
+                self._t_BC1, ("B1",)),
+            T("BC2", "BC", "BAS updates within 500 ms of hall close (manual)",
+                self._t_BC2, ("B1",)),
+            T("BC3", "BC", "BAS updates within 500 ms of USB plug (manual)",
+                self._t_BC3, ("B1",)),
+            T("BC4", "BC", "EMA frozen 90 s after USB unplug (manual)",
+                self._t_BC4, ("B1",)),
+            T("BC5", "BC", "Hall mid-window: record still arrives + BAS updates after window close (manual)",
+                self._t_BC5, ("B1",)),
+
+            # ── Bucket CAL — calibration validity (reference fixtures) ────
+            T("CAL1", "CAL", "Lux within ±20 % of luxon reference at 3 levels (manual)",
+                self._t_CAL1, ("B1",)),
+            T("CAL2", "CAL", "Temp within ±1 °C of reference thermometer (manual)",
+                self._t_CAL2, ("B1",)),
+            T("CAL3", "CAL", "dB within ±3 dB of SLM at known SPL (manual)",
+                self._t_CAL3, ("B1",)),
+
+            # ── Bucket TM — timing & health ───────────────────────────────
+            T("TM1", "TM",  "Zero ERR entries in journal during 5 min observation",
+                self._t_TM1, ("B1",)),
+            T("TM2", "TM",  "Status-char latency P95 < 100 ms across 30 probes",
+                self._t_TM2, ("B1",)),
+
+            # A6 (disconnect & reconnect) intentionally NOT registered —
+            # tearing down the link forces downstream re-auth and provides
+            # almost no diagnostic value over A2 (connect). Keep the
+            # _t_A6 method around as dead code so we can re-register later
+            # if needed.
         ]
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -3488,6 +3489,506 @@ class ValidationTab(ttk.Frame):
         except Exception as e:
             return self._mk("U2", "FAIL", f"error: {e}")
 
+    # ─────────────────────────────────────────────────────────────────────
+    #  Numeric-input helper (for CAL* tests).  Returns the entered float,
+    #  or None if the user cancelled the dialog.
+    # ─────────────────────────────────────────────────────────────────────
+    async def _ask_number(self, test_id: str, prompt: str,
+                           unit: str = "") -> Optional[float]:
+        from tkinter import simpledialog
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        def _ask():
+            try:
+                title = f"Manual entry — {test_id}"
+                full_prompt = f"{prompt}\n\nEnter value{(' in ' + unit) if unit else ''}:"
+                val = simpledialog.askfloat(title, full_prompt,
+                                             parent=self.winfo_toplevel())
+                if not fut.done():
+                    fut.set_result(val)
+            except Exception:
+                if not fut.done():
+                    fut.set_result(None)
+        # Dialog must run on Tk main thread; schedule and await the future.
+        self.after(0, _ask)
+        return await fut
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  Bucket W — 5 s sampling window contract
+    # ═════════════════════════════════════════════════════════════════════
+    async def _t_W1(self, ctx):
+        """Cadence — record interval within ±2 s of 60 s, across 3 cycles.
+        Tighter assertion than C1 (which allows 55-70 s)."""
+        await self._ensure_samples(ctx, n=3)
+        if len(ctx.samples) < 3:
+            return self._mk("W1", "INCONCLUSIVE",
+                             f"only {len(ctx.samples)} samples collected (need 3)")
+        gaps = [ctx.samples[i+1]["ts"] - ctx.samples[i]["ts"]
+                for i in range(len(ctx.samples) - 1)]
+        details = [f"gaps (s): {[round(g, 2) for g in gaps]}",
+                   f"expected: 60 ±2 s"]
+        bad = [g for g in gaps if abs(g - 60) > 2]
+        if not bad:
+            return self._mk("W1", "PASS",
+                             f"all gaps within ±2 s of 60 s", details)
+        return self._mk("W1", "FAIL",
+                         f"{len(bad)} gap(s) outside 60 ±2 s", details)
+
+    async def _t_W2(self, ctx):
+        """Every field non-sentinel for 3 consecutive cycles."""
+        await self._ensure_samples(ctx, n=3)
+        if len(ctx.samples) < 3:
+            return self._mk("W2", "INCONCLUSIVE",
+                             f"only {len(ctx.samples)} samples")
+        bad = []
+        for i, s in enumerate(ctx.samples[:3]):
+            issues = []
+            if s["temp"] is None: issues.append("temp=127")
+            if s["db"]   is None: issues.append("db=0xFF")
+            if s["lux"]  is None: issues.append("lux=0xFFFF")
+            if issues:
+                bad.append(f"sample {i}: {', '.join(issues)}")
+        if bad:
+            return self._mk("W2", "FAIL",
+                             f"{len(bad)} cycle(s) had sentinel(s)", bad)
+        return self._mk("W2", "PASS",
+                         "all 3 cycles fully populated",
+                         [f"sample {i}: {s}" for i, s in enumerate(ctx.samples[:3])])
+
+    async def _t_W3(self, ctx):
+        """peak_db >= db every cycle — invariant of the new energy aggregator."""
+        await self._ensure_samples(ctx, n=3)
+        if len(ctx.samples) < 1:
+            return self._mk("W3", "INCONCLUSIVE", "no samples")
+        violations = []
+        for i, s in enumerate(ctx.samples):
+            db = s.get("db")
+            peak = s.get("peak_db")
+            if db is None or peak is None:
+                continue
+            if peak < db:
+                violations.append(f"sample {i}: peak={peak} < db={db}")
+        if violations:
+            return self._mk("W3", "FAIL",
+                             f"{len(violations)} cycle(s) violated peak ≥ avg",
+                             violations)
+        return self._mk("W3", "PASS",
+                         "peak_db ≥ db on every cycle",
+                         [f"sample {i}: db={s['db']} peak={s.get('peak_db')}"
+                          for i, s in enumerate(ctx.samples)])
+
+    async def _t_W4(self, ctx):
+        """Lux > 100 at room ambient — sanity check post-calibration."""
+        ok = await self._ask_pass_fail(
+            "W4 ambient lux",
+            "Place the device in normal room lighting (lit office or living room).\n\n"
+            "Click Pass when the device is positioned, then I'll read lux from "
+            "the next sensor cycle.")
+        if not ok:
+            return self._mk("W4", "FAIL", "user cancelled before positioning")
+        ctx.samples.clear()
+        await self._ensure_samples(ctx, n=1)
+        if not ctx.samples or ctx.samples[0]["lux"] is None:
+            return self._mk("W4", "FAIL", "no lux reading or sentinel value")
+        lux = ctx.samples[0]["lux"]
+        if lux >= 100:
+            return self._mk("W4", "PASS",
+                             f"lux={lux} (≥ 100 expected at room ambient)",
+                             [f"reading: {lux}"])
+        return self._mk("W4", "FAIL",
+                         f"lux={lux} below 100 — too dark, or sensor under-reads",
+                         [f"reading: {lux}",
+                          "check LUX_CAL_FACTOR in firmware app_config.h"])
+
+    async def _t_W5(self, ctx):
+        """Temp within ±2 °C of a reference thermometer reading."""
+        ref = await self._ask_number(
+            "W5 temp ref",
+            "Place a reference thermometer next to the device.\n"
+            "Wait for both to settle (~1 minute).\n"
+            "Then enter the thermometer's reading.",
+            unit="°C")
+        if ref is None:
+            return self._mk("W5", "FAIL", "user cancelled / no reading entered")
+        ctx.samples.clear()
+        await self._ensure_samples(ctx, n=1)
+        if not ctx.samples or ctx.samples[0]["temp"] is None:
+            return self._mk("W5", "FAIL", "no temp reading or sentinel")
+        dev = ctx.samples[0]["temp"]
+        diff = abs(dev - ref)
+        details = [f"reference: {ref:.1f} °C",
+                   f"device:    {dev} °C",
+                   f"diff:      {diff:.1f} °C"]
+        if diff <= 2:
+            return self._mk("W5", "PASS", f"within ±2 °C (Δ={diff:.1f})", details)
+        return self._mk("W5", "FAIL",
+                         f"Δ={diff:.1f} °C exceeds ±2 °C — "
+                         "tune TEMP_CAL_OFFSET_TENTHS", details)
+
+    async def _t_W6(self, ctx):
+        """dB jumps ≥ 10 dB on a loud sound (mic responsiveness)."""
+        # Capture a quiet baseline first
+        ctx.samples.clear()
+        await self._ensure_samples(ctx, n=1)
+        if not ctx.samples or ctx.samples[0]["db"] is None:
+            return self._mk("W6", "FAIL", "baseline dB unreadable")
+        quiet_db = ctx.samples[0]["db"]
+        ctx.detail(f"quiet baseline: db={quiet_db}")
+        ok = await self._ask_pass_fail(
+            "W6 loud sound",
+            f"Baseline dB just measured: {quiet_db}\n\n"
+            "Now make a LOUD continuous sound near the device (clap, voice, "
+            "speaker) and keep it going for ~1 minute (one full sensor "
+            "cycle).\n\nClick Pass when ready — I'll grab the next sample.")
+        if not ok:
+            return self._mk("W6", "FAIL", "user cancelled")
+        ctx.samples.clear()
+        await self._ensure_samples(ctx, n=1)
+        if not ctx.samples or ctx.samples[0]["db"] is None:
+            return self._mk("W6", "FAIL", "loud-sample dB unreadable")
+        loud_db = ctx.samples[0]["db"]
+        delta = loud_db - quiet_db
+        details = [f"quiet: {quiet_db} dB", f"loud:  {loud_db} dB",
+                   f"delta: {delta} dB"]
+        if delta >= 10:
+            return self._mk("W6", "PASS",
+                             f"+{delta} dB on loud sound", details)
+        return self._mk("W6", "FAIL",
+                         f"only +{delta} dB — mic may be insensitive, "
+                         "PDM_SPL_OFFSET_DB may be miscalibrated, "
+                         "or sound wasn't loud enough", details)
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  Bucket BC — battery cache + refresh-on-event
+    # ═════════════════════════════════════════════════════════════════════
+    async def _t_BC1(self, ctx):
+        """BAS char and Status.batt_pct must agree — cache parity."""
+        try:
+            status = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            bas    = (await self.ble.read(CHAR_BATT_LEVEL))[0]
+            sb     = status.get("batt_pct")
+            details = [f"BAS:           {bas} %",
+                       f"Status.batt_pct: {sb} %"]
+            if sb == bas:
+                return self._mk("BC1", "PASS",
+                                 f"both report {bas} %", details)
+            return self._mk("BC1", "FAIL",
+                             f"BAS={bas} ≠ Status={sb}", details)
+        except Exception as e:
+            return self._mk("BC1", "FAIL", f"read error: {e}")
+
+    async def _t_BC2(self, ctx):
+        """BAS notify must arrive within 500 ms of hall close."""
+        return await self._refresh_on_event(
+            "BC2", "Close the lid magnet against the device now.",
+            char=CHAR_BATT_LEVEL, deadline_ms=500)
+
+    async def _t_BC3(self, ctx):
+        """BAS notify must arrive within 500 ms of USB plug-in."""
+        return await self._refresh_on_event(
+            "BC3", "Plug a USB cable into the device now.",
+            char=CHAR_BATT_LEVEL, deadline_ms=500)
+
+    async def _t_BC4(self, ctx):
+        """After USB unplug, BAS EMA must stay frozen for 90 s (lockout)."""
+        try:
+            pre_status = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            if not pre_status.get("usb"):
+                return self._mk("BC4", "FAIL",
+                                 "USB not currently connected — plug in first")
+            ok = await self._ask_pass_fail(
+                "BC4 USB unplug lockout",
+                "Unplug the USB cable now. After unplug, the BAS value "
+                "should stay frozen for 90 s (no EMA decay).\n\n"
+                "Click Pass after you've unplugged the cable.")
+            if not ok:
+                return self._mk("BC4", "FAIL", "user cancelled")
+            # Read 5 BAS values over ~90 s and assert they don't decrease.
+            ctx.detail("sampling BAS every 18 s for 90 s …")
+            readings = []
+            for i in range(5):
+                await asyncio.sleep(18)
+                v = (await self.ble.read(CHAR_BATT_LEVEL))[0]
+                readings.append(v)
+                ctx.detail(f"  t={18*(i+1)}s   bas={v}")
+            details = [f"readings: {readings}"]
+            decreases = [readings[i+1] - readings[i] for i in range(4)]
+            if any(d < 0 for d in decreases):
+                return self._mk("BC4", "FAIL",
+                                 f"BAS decreased during lockout: deltas={decreases}",
+                                 details)
+            return self._mk("BC4", "PASS",
+                             "BAS stable across 90 s lockout window", details)
+        except Exception as e:
+            return self._mk("BC4", "FAIL", f"error: {e}")
+
+    async def _t_BC5(self, ctx):
+        """Hall event mid-window: assert window completes + BAS refreshes
+        after window close (not during)."""
+        ok = await self._ask_pass_fail(
+            "BC5 hall mid-window",
+            "I'll wait for the next sensor cycle to BEGIN, then prompt you to "
+            "TOGGLE the lid magnet while the window is open.\n\n"
+            "Click Pass to start.")
+        if not ok:
+            return self._mk("BC5", "FAIL", "user cancelled")
+        # Subscribe to sensor + BAS; wait for a sensor notify (cycle close),
+        # then a small delay, then ask user to toggle hall.
+        sensor_times: list = []
+        bas_times: list = []
+        evt = asyncio.Event()
+
+        def _on_sensor(_h, data):
+            sensor_times.append(time.time())
+            if len(sensor_times) >= 2:
+                evt.set()
+
+        def _on_bas(_h, data):
+            bas_times.append(time.time())
+
+        try:
+            await self.ble.subscribe(CHAR_SENSOR_DATA, _on_sensor)
+            await self.ble.subscribe(CHAR_BATT_LEVEL,  _on_bas)
+            # Wait up to 65 s for first cycle close
+            for _ in range(65):
+                if sensor_times:
+                    break
+                await asyncio.sleep(1)
+            if not sensor_times:
+                return self._mk("BC5", "INCONCLUSIVE",
+                                 "no sensor notify within 65 s")
+            ctx.detail("first cycle observed; toggle the lid magnet now")
+            ok2 = await self._ask_pass_fail(
+                "BC5 toggle now",
+                "Toggle the lid magnet (close → open, or open → close) NOW.\n\n"
+                "Click Pass after toggling.")
+            if not ok2:
+                return self._mk("BC5", "FAIL", "user cancelled toggle")
+            # Wait up to 65 s for the next sensor notify
+            for _ in range(65):
+                if len(sensor_times) >= 2:
+                    break
+                await asyncio.sleep(1)
+            # PASS if:
+            #   - second sensor record arrived (window survived hall mid-flight)
+            #   - at least one BAS notify between the two sensor times (refresh
+            #     fired after window close, not during)
+            if len(sensor_times) < 2:
+                return self._mk("BC5", "FAIL",
+                                 "no second sensor notify — window may have aborted")
+            in_window_bas = [t for t in bas_times
+                             if sensor_times[0] < t <= sensor_times[1] + 2]
+            details = [f"sensor #1: {sensor_times[0]:.2f}",
+                       f"sensor #2: {sensor_times[1]:.2f}",
+                       f"BAS notifies between them: {len(in_window_bas)}"]
+            if in_window_bas:
+                return self._mk("BC5", "PASS",
+                                 "window completed + BAS refreshed", details)
+            return self._mk("BC5", "INCONCLUSIVE",
+                             "window completed but no BAS refresh seen "
+                             "(may have raced with window close)", details)
+        finally:
+            try:
+                await self.ble.unsubscribe(CHAR_SENSOR_DATA)
+                await self.ble.unsubscribe(CHAR_BATT_LEVEL)
+            except Exception:
+                pass
+
+    async def _refresh_on_event(self, tid: str, prompt: str,
+                                 char: str, deadline_ms: int):
+        """Shared helper for BC2/BC3 — prompt the user to perform a physical
+        action, then assert a notification on `char` arrives within deadline_ms."""
+        notify_times: list = []
+        evt = asyncio.Event()
+
+        def _on_notify(_h, data):
+            notify_times.append(time.time())
+            evt.set()
+
+        try:
+            await self.ble.subscribe(char, _on_notify)
+            # Brief settle so any in-flight notify doesn't race the prompt
+            await asyncio.sleep(0.2)
+            notify_times.clear()
+            ok = await self._ask_pass_fail(tid, prompt + "\n\n"
+                                            "Click Pass AFTER performing the action.")
+            if not ok:
+                return self._mk(tid, "FAIL", "user cancelled before action")
+            action_time = time.time()
+            try:
+                await asyncio.wait_for(evt.wait(),
+                                        timeout=deadline_ms / 1000.0 + 1.0)
+            except asyncio.TimeoutError:
+                return self._mk(tid, "FAIL",
+                                 f"no notify on {char[:8]} within "
+                                 f"{deadline_ms} ms of action")
+            elapsed_ms = int((notify_times[0] - action_time) * 1000)
+            details = [f"action at:  {action_time:.3f}",
+                       f"notify at:  {notify_times[0]:.3f}",
+                       f"elapsed:    {elapsed_ms} ms",
+                       f"deadline:   {deadline_ms} ms"]
+            if elapsed_ms <= deadline_ms:
+                return self._mk(tid, "PASS",
+                                 f"notify in {elapsed_ms} ms (≤ {deadline_ms})",
+                                 details)
+            return self._mk(tid, "FAIL",
+                             f"notify in {elapsed_ms} ms exceeded {deadline_ms} ms",
+                             details)
+        finally:
+            try:
+                await self.ble.unsubscribe(char)
+            except Exception:
+                pass
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  Bucket CAL — calibration validity against reference instruments
+    # ═════════════════════════════════════════════════════════════════════
+    async def _t_CAL1(self, ctx):
+        """Lux within ±20 % of luxon reference at 3 brightness levels."""
+        ratios = []
+        details = []
+        for i, hint in enumerate(["dim (~150 lux)",
+                                    "moderate (~400 lux)",
+                                    "bright (~800 lux)"], 1):
+            ref = await self._ask_number(
+                f"CAL1 level {i}",
+                f"Set lighting to {hint} (use the luxon meter to confirm),\n"
+                f"position the device next to the luxon sensor, then enter "
+                f"the luxon's reading.",
+                unit="lux")
+            if ref is None or ref <= 0:
+                return self._mk("CAL1", "FAIL",
+                                 f"level {i}: no reference entered")
+            ctx.samples.clear()
+            await self._ensure_samples(ctx, n=1)
+            if not ctx.samples or ctx.samples[0]["lux"] is None:
+                return self._mk("CAL1", "FAIL",
+                                 f"level {i}: no device lux reading")
+            dev = ctx.samples[0]["lux"]
+            ratio = dev / ref if ref > 0 else 0
+            ratios.append(ratio)
+            details.append(f"level {i}: ref={ref:.0f}  device={dev}  "
+                            f"ratio={ratio:.2f}")
+        out_of_band = [r for r in ratios if not (0.8 <= r <= 1.2)]
+        if not out_of_band:
+            return self._mk("CAL1", "PASS",
+                             "all 3 ratios in [0.8, 1.2]", details)
+        return self._mk("CAL1", "FAIL",
+                         f"{len(out_of_band)} level(s) outside ±20 % — "
+                         f"re-tune LUX_CAL_FACTOR", details)
+
+    async def _t_CAL2(self, ctx):
+        """Temp within ±1 °C of reference thermometer."""
+        ref = await self._ask_number(
+            "CAL2 temp",
+            "Place a reference thermometer next to the device.\n"
+            "Wait 2 minutes for both to settle, then enter the thermometer's reading.",
+            unit="°C")
+        if ref is None:
+            return self._mk("CAL2", "FAIL", "no reference entered")
+        ctx.samples.clear()
+        await self._ensure_samples(ctx, n=2)
+        if not ctx.samples:
+            return self._mk("CAL2", "FAIL", "no device temp reading")
+        dev_avg = sum(s["temp"] for s in ctx.samples
+                      if s["temp"] is not None) / len(ctx.samples)
+        diff = abs(dev_avg - ref)
+        details = [f"reference: {ref:.1f} °C",
+                   f"device avg: {dev_avg:.1f} °C ({len(ctx.samples)} samples)",
+                   f"diff:       {diff:.2f} °C"]
+        if diff <= 1.0:
+            return self._mk("CAL2", "PASS",
+                             f"within ±1 °C (Δ={diff:.2f})", details)
+        return self._mk("CAL2", "FAIL",
+                         f"Δ={diff:.2f} °C exceeds ±1 °C — "
+                         "tune TEMP_CAL_OFFSET_TENTHS", details)
+
+    async def _t_CAL3(self, ctx):
+        """dB within ±3 dB of SLM reading at a steady SPL."""
+        ok = await self._ask_pass_fail(
+            "CAL3 dB ref",
+            "Set up a sound source at a stable, known SPL (e.g. tone "
+            "generator at ~70 dB).\n"
+            "Position the SLM and device side-by-side, sound facing both.\n\n"
+            "Click Pass when ready to capture a reading.")
+        if not ok:
+            return self._mk("CAL3", "FAIL", "user cancelled")
+        ref = await self._ask_number(
+            "CAL3 SLM reading",
+            "Enter the SLM's current reading.", unit="dB SPL")
+        if ref is None:
+            return self._mk("CAL3", "FAIL", "no SLM reading entered")
+        ctx.samples.clear()
+        await self._ensure_samples(ctx, n=2)
+        if not ctx.samples:
+            return self._mk("CAL3", "FAIL", "no device dB reading")
+        dev_avg = sum(s["db"] for s in ctx.samples
+                      if s["db"] is not None) / len(ctx.samples)
+        diff = abs(dev_avg - ref)
+        details = [f"SLM:        {ref:.1f} dB",
+                   f"device avg: {dev_avg:.1f} dB",
+                   f"diff:       {diff:.2f} dB"]
+        if diff <= 3.0:
+            return self._mk("CAL3", "PASS",
+                             f"within ±3 dB (Δ={diff:.2f})", details)
+        return self._mk("CAL3", "FAIL",
+                         f"Δ={diff:.2f} dB exceeds ±3 dB — "
+                         "tune PDM_SPL_OFFSET_DB", details)
+
+    # ═════════════════════════════════════════════════════════════════════
+    #  Bucket TM — timing / health
+    # ═════════════════════════════════════════════════════════════════════
+    async def _t_TM1(self, ctx):
+        """No EVENT_ERROR entries in journal over the observation window.
+        Reuses the cached journal download (`_ensure_journal`)."""
+        await self._ensure_journal(ctx)
+        if not ctx.journal:
+            return self._mk("TM1", "INCONCLUSIVE",
+                             "journal empty (download may have failed)")
+        # EVENT_ERROR is type 3 per flash.h.
+        err_entries = [e for e in ctx.journal if e.get("type") == 3]
+        details = [f"total journal entries: {len(ctx.journal)}",
+                   f"ERROR entries:         {len(err_entries)}"]
+        if not err_entries:
+            return self._mk("TM1", "PASS",
+                             "no ERROR entries in journal", details)
+        details.extend(f"  {e}" for e in err_entries[:5])
+        if len(err_entries) > 5:
+            details.append(f"  … {len(err_entries) - 5} more")
+        return self._mk("TM1", "FAIL",
+                         f"{len(err_entries)} ERROR entries in journal",
+                         details)
+
+    async def _t_TM2(self, ctx):
+        """Status-char read latency stable: P95 < 100 ms across 30 probes."""
+        rtts = []
+        for _ in range(30):
+            t0 = time.perf_counter()
+            try:
+                await self.ble.read(CHAR_STATUS)
+                rtts.append((time.perf_counter() - t0) * 1000)
+            except Exception as e:
+                ctx.detail(f"probe error: {e}")
+            await asyncio.sleep(1.0)
+        if len(rtts) < 20:
+            return self._mk("TM2", "INCONCLUSIVE",
+                             f"only {len(rtts)} probes succeeded")
+        rtts.sort()
+        p50 = rtts[len(rtts) // 2]
+        p95 = rtts[int(len(rtts) * 0.95)]
+        worst = rtts[-1]
+        details = [f"probes: {len(rtts)}",
+                   f"median: {p50:.0f} ms",
+                   f"P95:    {p95:.0f} ms",
+                   f"max:    {worst:.0f} ms"]
+        if p95 < 100:
+            return self._mk("TM2", "PASS",
+                             f"P95 = {p95:.0f} ms (< 100)", details)
+        return self._mk("TM2", "FAIL",
+                         f"P95 = {p95:.0f} ms exceeds 100 ms — "
+                         "BLE link or main-loop pressure", details)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Haptic tab
@@ -3497,6 +3998,8 @@ class HapticTab(ttk.Frame):
     def __init__(self, parent, ble: BLEManager):
         super().__init__(parent)
         self.ble = ble
+        # Idempotency flag for tab-open auto-subscribe to CHAR_HAPTIC_STAT.
+        self._subscribed = False
 
         frm = ttk.LabelFrame(self, text="Haptic Motor Control", padding=10)
         frm.pack(fill="x", padx=6, pady=6)
@@ -3614,10 +4117,24 @@ class HapticTab(ttk.Frame):
         async def _s():
             try:
                 await self.ble.subscribe(CHAR_HAPTIC_STAT, _on_stat)
+                self._subscribed = True
                 self._log("Subscribed to haptic status.")
             except Exception as e:
                 self._log(f"Error: {e}")
         run_async(_s())
+
+    def _on_tab_visible(self):
+        """Auto-subscribe to haptic status when the user switches to this tab,
+        so the live IDLE/BUZZING/COUNTDOWN indicator appears without a manual
+        Subscribe click.  Idempotent — silently no-ops if disconnected or
+        already subscribed for this connection."""
+        if not self.ble.connected or self._subscribed:
+            return
+        self._sub_status()
+
+    def _on_disconnected(self):
+        """Reset subscribe flag so a reconnect + tab-revisit re-subscribes."""
+        self._subscribed = False
 
     def _set_reminder(self, enable: bool):
         """Write the 5-byte Recurring Reminder rule (0x1537).
@@ -3686,36 +4203,45 @@ class BatteryTab(ttk.Frame):
         self.ble = ble
         self._last_pct: Optional[int] = None
         self._subscribed = False
-        # Chart history — capped to BATT_HISTORY_MAX so memory doesn't grow
-        # unbounded during long sessions. (time-of-reading, percent) pairs.
-        self._chart_pcts: List[int] = []
-        self._chart_t0:   Optional[float] = None  # session start, for x-axis
+        # NOTE: "Battery % over session" chart removed per UX overhaul —
+        # the visual icon on the left of the live readout + the 50-row
+        # history list cover the same need with less clutter.
 
-        # ── Live readout ──────────────────────────────────────────────────
+        # ── Live readout (battery icon on the LEFT) ──────────────────────
         live = ttk.LabelFrame(self, text="Live Battery Level", padding=10)
         live.pack(fill="x", padx=6, pady=6)
+
+        # Visual battery — vertical rectangle with a tip cap; fill height
+        # tracks percent.  Drawn on a Tk Canvas (no extra deps).
+        # NOTE: don't try to read live.cget("background") — ttk widgets
+        # don't expose `-background` (TclError). Default canvas bg is fine.
+        self.batt_canvas = tk.Canvas(live, width=80, height=160,
+                                       highlightthickness=0)
+        self.batt_canvas.grid(row=0, column=0, rowspan=3, padx=(6, 18),
+                              pady=4)
+        self._draw_battery(pct=None)
 
         self.pct_var = tk.StringVar(value="--")
         self.pct_label = tk.Label(live, textvariable=self.pct_var,
                                    font=("Courier", 28, "bold"),
                                    foreground="gray", width=6, anchor="center")
-        self.pct_label.grid(row=0, column=0, rowspan=2, padx=12, pady=4)
+        self.pct_label.grid(row=0, column=1, rowspan=2, padx=12, pady=4)
 
         self.unit_label = tk.Label(live, text="%", font=("Courier", 18, "bold"),
                                     foreground="gray")
-        self.unit_label.grid(row=0, column=1, rowspan=2, sticky="w")
+        self.unit_label.grid(row=0, column=2, rowspan=2, sticky="w")
 
-        ttk.Label(live, text="Last update:").grid(row=0, column=2, sticky="e", padx=8)
+        ttk.Label(live, text="Last update:").grid(row=0, column=3, sticky="e", padx=8)
         self.last_var = tk.StringVar(value="(never)")
         ttk.Label(live, textvariable=self.last_var,
-                  font=("Courier", 10)).grid(row=0, column=3, sticky="w")
+                  font=("Courier", 10)).grid(row=0, column=4, sticky="w")
 
-        ttk.Label(live, text="Subscription:").grid(row=1, column=2, sticky="e", padx=8)
+        ttk.Label(live, text="Subscription:").grid(row=1, column=3, sticky="e", padx=8)
         self.sub_var = tk.StringVar(value="off")
         self.sub_label = ttk.Label(live, textvariable=self.sub_var,
                                     font=("Courier", 10, "bold"),
                                     foreground="gray")
-        self.sub_label.grid(row=1, column=3, sticky="w")
+        self.sub_label.grid(row=1, column=4, sticky="w")
 
         # ── Action buttons ────────────────────────────────────────────────
         btns = ttk.Frame(self)
@@ -3728,22 +4254,6 @@ class BatteryTab(ttk.Frame):
                    command=self._do_unsubscribe).pack(side="left", padx=4)
         ttk.Button(btns, text="Clear History",
                    command=self._do_clear).pack(side="left", padx=4)
-
-        # ── Chart (battery % over time) ──────────────────────────────────
-        # Fixed height; history list and log split the remaining space.
-        if HAS_MPL:
-            chart_frame = ttk.LabelFrame(self, text="Battery % over session",
-                                          padding=4)
-            chart_frame.pack(fill="x", padx=6, pady=4)
-            fig = Figure(figsize=(7, 2.4), dpi=90)
-            fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.22)
-            self.ax_batt = fig.add_subplot(111)
-            self.batt_canvas = FigureCanvasTkAgg(fig, master=chart_frame)
-            self.batt_canvas.get_tk_widget().pack(fill="x", expand=False)
-            self._draw_chart()
-        else:
-            self.ax_batt = None
-            self.batt_canvas = None
 
         # ── History list ──────────────────────────────────────────────────
         hist_frame = ttk.LabelFrame(self, text="History (last 50 readings)",
@@ -3789,36 +4299,53 @@ class BatteryTab(ttk.Frame):
             return "#cf8a17"     # orange
         return "#c0392b"         # red
 
-    def _draw_chart(self):
-        """Redraw the rolling battery chart. Safe to call when MPL is absent."""
-        if not HAS_MPL or self.ax_batt is None:
-            return
-        ax = self.ax_batt
-        ax.clear()
-        ax.set_ylim(0, 100)
-        ax.set_xlabel("reading #", fontsize=8)
-        ax.set_ylabel("battery %", fontsize=8)
-        ax.grid(True, alpha=0.4)
-        # Threshold bands so the colour key matches the live readout.
-        ax.axhspan(0,  20, facecolor="#c0392b", alpha=0.08)
-        ax.axhspan(20, 50, facecolor="#cf8a17", alpha=0.08)
-        ax.axhspan(50, 80, facecolor="#1f5fbf", alpha=0.08)
-        ax.axhspan(80, 100, facecolor="#1b8c3a", alpha=0.08)
-
-        if self._chart_pcts:
-            xs = list(range(1, len(self._chart_pcts) + 1))
-            ax.plot(xs, self._chart_pcts, "-o", ms=4,
-                    color="#1f5fbf", linewidth=1.6)
-            # Annotate the latest point with the current %
-            ax.annotate(f"{self._chart_pcts[-1]} %",
-                        xy=(xs[-1], self._chart_pcts[-1]),
-                        xytext=(4, 4), textcoords="offset points", fontsize=8)
-
-        ax.tick_params(labelsize=8)
-        self.batt_canvas.draw_idle()
+    def _draw_battery(self, pct: Optional[int]):
+        """Render a vertical battery icon on the canvas.  pct=None draws an
+        empty (grey) battery; otherwise the inner rectangle fills from the
+        bottom up to `pct` percent.  Color thresholds match `_colour_for`."""
+        c = self.batt_canvas
+        c.delete("all")
+        w  = int(c.cget("width"))
+        h  = int(c.cget("height"))
+        # Battery body outline (with a small top cap).
+        cap_w = w // 3
+        cap_h = 10
+        body_top    = cap_h
+        body_left   = 6
+        body_right  = w - 6
+        body_bottom = h - 6
+        # Cap (small rectangle at top)
+        cap_left  = (w - cap_w) // 2
+        cap_right = cap_left + cap_w
+        c.create_rectangle(cap_left, 0, cap_right, cap_h,
+                            fill="#7f8c8d", outline="#34495e", width=1)
+        # Body outline
+        c.create_rectangle(body_left, body_top, body_right, body_bottom,
+                            outline="#34495e", width=2)
+        # Fill — proportional from the bottom up
+        if pct is not None:
+            pct_clamped = max(0, min(100, int(pct)))
+            inner_h = body_bottom - body_top - 4
+            fill_h  = int(inner_h * pct_clamped / 100)
+            if fill_h > 0:
+                fill_top = body_bottom - 2 - fill_h
+                c.create_rectangle(body_left + 2, fill_top,
+                                    body_right - 2, body_bottom - 2,
+                                    fill=self._colour_for(pct_clamped),
+                                    outline="")
+            # Centred percent label inside the body
+            c.create_text((body_left + body_right) // 2,
+                          (body_top + body_bottom) // 2,
+                          text=f"{pct_clamped}%",
+                          font=("Segoe UI", 14, "bold"),
+                          fill="white" if pct_clamped >= 35 else "#2c3e50")
+        else:
+            c.create_text(w // 2, h // 2, text="--",
+                          font=("Segoe UI", 14, "bold"),
+                          fill="#95a5a6")
 
     def _apply_reading(self, pct: int):
-        """Push a new reading into the live readout, chart, and history list."""
+        """Push a new reading into the live readout, icon, and history list."""
         delta = 0 if self._last_pct is None else pct - self._last_pct
         self._last_pct = pct
 
@@ -3828,11 +4355,8 @@ class BatteryTab(ttk.Frame):
         self.unit_label.configure(foreground=colour)
         self.last_var.set(ts())
 
-        # Chart history (capped)
-        self._chart_pcts.append(pct)
-        if len(self._chart_pcts) > BATT_HISTORY_MAX:
-            self._chart_pcts.pop(0)
-        self._draw_chart()
+        # Redraw the visual battery icon
+        self._draw_battery(pct)
 
         delta_str = f"{delta:+d}" if delta != 0 else "0"
         self.tree.insert("", 0, values=(ts(), f"{pct} %", delta_str))
@@ -3906,6 +4430,11 @@ class BatteryTab(ttk.Frame):
                 self._log(f"Auto-subscribe failed: {e}")
         run_async(_sub())
 
+    def _on_tab_visible(self):
+        """Fired by App._on_tab_changed when the user switches to this tab.
+        Same idempotent subscribe as auto_subscribe()."""
+        self.auto_subscribe()
+
     def _do_unsubscribe(self):
         if not self.ble.connected or not self._subscribed:
             return
@@ -3923,20 +4452,18 @@ class BatteryTab(ttk.Frame):
     def _do_clear(self):
         for row in self.tree.get_children():
             self.tree.delete(row)
-        self._chart_pcts.clear()
         self._last_pct = None
-        self._draw_chart()
+        self._draw_battery(None)
         self._log("History cleared.")
 
     def _on_disconnected(self):
-        """Wipe live readout, chart, and history when the BLE link drops.
+        """Wipe live readout, icon, and history when the BLE link drops.
         Also resets _subscribed so the next auto_subscribe() actually fires
         instead of taking the 'already subscribed' early-return."""
         for row in self.tree.get_children():
             self.tree.delete(row)
-        self._chart_pcts.clear()
         self._last_pct = None
-        self._draw_chart()
+        self._draw_battery(None)
 
         self.pct_var.set("--")
         self.pct_label.configure(foreground="gray")
@@ -4263,20 +4790,26 @@ def decode_dusq_msd(payload):
 
 
 class AdvTab(ttk.Frame):
-    """Continuously scans for DUSQ_CHARGER devices and decodes the MSD payload
-    from every advertisement. No connection is opened — purely passive.
+    """Continuously scans for BLE advertisers, decodes the DUSQ MSD payload
+    where present, and lets the user connect by double-clicking any row.
 
-    Filter: device name must contain "DUSQ_CHARGER" (case-insensitive).
-    Company ID 0xFFFF alone is too loose (other dev devices use it too)."""
+    Default filter: device name contains "DUSQ_CHARGER" OR a valid DUSQ MSD
+    decodes. Tick "Show all (debug)" to also list non-DUSQ devices (with
+    name / MAC / RSSI only — no decoded columns)."""
 
     REFRESH_MS = 500   # period for "Seen N s ago" refresh
 
-    def __init__(self, parent, ble: BLEManager):
+    def __init__(self, parent, ble: BLEManager, status_var: tk.StringVar):
         super().__init__(parent)
         self.ble = ble
+        self.status_var = status_var
         self._scanner = None
         self._scanning = False
-        self._devices = {}   # addr -> {'rssi', 'raw', 'decoded', 'seen'}
+        # addr -> {'name', 'rssi', 'raw', 'decoded', 'seen', 'is_target'}
+        self._devices = {}
+        # Wire BLE log/disconnect callbacks (ported from old ConnectionTab)
+        self.ble.log_cb = self._log
+        self.ble.on_disconnect_cb = self._on_disconnected
 
         # --- Controls -------------------------------------------------------
         ctrl = ttk.Frame(self)
@@ -4286,17 +4819,26 @@ class AdvTab(ttk.Frame):
         self.scan_btn.pack(side="left")
         ttk.Button(ctrl, text="Clear", command=self._clear
                   ).pack(side="left", padx=6)
-        self.status_var = tk.StringVar(value="Idle. Press Start scanning to begin.")
-        ttk.Label(ctrl, textvariable=self.status_var,
+        # Show-all toggle: when on, accept non-DUSQ adverts too and render
+        # them with `—` in all decoded columns. Useful to confirm the BLE
+        # stack is alive when the target isn't appearing.
+        self.show_all = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctrl, text="Show all (debug)",
+                        variable=self.show_all,
+                        command=self._refresh_tree).pack(side="left", padx=8)
+        self.scan_status_var = tk.StringVar(
+            value="Idle. Press Start scanning to begin.")
+        ttk.Label(ctrl, textvariable=self.scan_status_var,
                   foreground="gray").pack(side="left", padx=10)
 
         # --- Device table ---------------------------------------------------
-        cols = ("address", "rssi", "state", "usb", "charging", "lid", "auth",
-                "batt", "blocks", "journal", "last_sync", "seen")
+        cols = ("name", "address", "rssi", "state", "usb", "charging", "lid",
+                "auth", "batt", "blocks", "journal", "last_sync", "seen")
         self.tree = ttk.Treeview(self, columns=cols, show="headings",
-                                  selectmode="browse", height=14)
+                                  selectmode="browse", height=12)
         for col, label, width in [
-            ("address",   "MAC",          170),
+            ("name",      "Name",         150),
+            ("address",   "MAC",          160),
             ("rssi",      "RSSI",         60),
             ("state",     "State",        110),
             ("usb",       "USB",          50),
@@ -4311,43 +4853,26 @@ class AdvTab(ttk.Frame):
         ]:
             self.tree.heading(col, text=label)
             self.tree.column(col, width=width, anchor="w")
+        # Highlight DUSQ targets so they pop out of a long Show-all list.
+        self.tree.tag_configure("target", background="#8FA97A",
+                                 foreground="black")
         self.tree.pack(fill="both", expand=True, padx=6, pady=4)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        # Double-click any row → connect immediately.
+        self.tree.bind("<Double-1>", self._on_row_double_click)
 
-        # --- Raw bytes for selected row ------------------------------------
-        raw_frm = ttk.LabelFrame(self, text="Raw MSD (selected row)", padding=6)
-        raw_frm.pack(fill="x", padx=6, pady=(0, 6))
-        self.raw_var = tk.StringVar(value="(select a row above)")
-        ttk.Label(raw_frm, textvariable=self.raw_var,
-                  font=("Courier", 9)).pack(anchor="w")
-
-        # --- Manual MSD decoder --------------------------------------------
-        dec_frm = ttk.LabelFrame(
-            self, text="Manual decoder (paste hex bytes from any tool)", padding=6)
-        dec_frm.pack(fill="x", padx=6, pady=(0, 6))
-
-        ttk.Label(dec_frm, text="Hex (with or without 0xFFFF company ID prefix):",
-                  foreground="gray").pack(anchor="w")
-        self.dec_input_var = tk.StringVar()
-        ent = ttk.Entry(dec_frm, textvariable=self.dec_input_var,
-                        font=("Courier", 9))
-        ent.pack(fill="x", pady=2)
-        ent.bind("<Return>", lambda _e: self._do_manual_decode())
-        btn_row = ttk.Frame(dec_frm)
-        btn_row.pack(fill="x")
-        ttk.Button(btn_row, text="Decode",
-                   command=self._do_manual_decode).pack(side="left", pady=2)
-        ttk.Label(btn_row,
-                  text="(accepts '02 2D 00 …', '0x02 0x2D …', 'FFFF022D…', etc.)",
-                  foreground="gray").pack(side="left", padx=8)
-        self.dec_output_var = tk.StringVar(
-            value="(paste hex bytes above and click Decode)")
-        ttk.Label(dec_frm, textvariable=self.dec_output_var,
-                  font=("Courier", 9), justify="left",
-                  anchor="w").pack(fill="x", pady=(4, 0))
+        # --- Connection log (ported from old ConnectionTab) ----------------
+        lf2 = ttk.LabelFrame(self, text="Connection log", padding=4)
+        lf2.pack(fill="both", expand=False, padx=6, pady=(0, 6))
+        self.log_box = scrolledtext.ScrolledText(lf2, height=6, state="disabled",
+                                                  font=("Courier", 9))
+        self.log_box.pack(fill="both", expand=True)
 
         # Periodic redraw for "Seen N s ago" so silent devices visibly age
         self.after(self.REFRESH_MS, self._redraw_periodic)
+        # Auto-start scanning so the user sees devices the moment they
+        # open the app — no need to click Start.
+        self.after(200, self._start_scan)
 
     # ------------------------------------------------------------------ public
     def stop(self):
@@ -4367,13 +4892,15 @@ class AdvTab(ttk.Frame):
     def _start_scan(self):
         self._scanning = True
         self.scan_btn.configure(text="■ Stop scanning")
-        self.status_var.set("Scanning… (passive, no connection)")
+        self.scan_status_var.set("Scanning… (passive, no connection)")
+        self._log("Scan started (continuous, passive).")
         run_async(self._scan_loop())
 
     def _stop_scan(self):
         self._scanning = False
         self.scan_btn.configure(text="▶ Start scanning")
-        self.status_var.set("Stopped.")
+        self.scan_status_var.set("Stopped.")
+        self._log("Scan stopped.")
         if self._scanner:
             run_async(self._scanner.stop())
 
@@ -4385,55 +4912,69 @@ class AdvTab(ttk.Frame):
                 await asyncio.sleep(0.5)
             await self._scanner.stop()
         except Exception as e:
-            self.status_var.set(f"Scan error: {e}")
+            self.scan_status_var.set(f"Scan error: {e}")
+            self._log(f"Scan error: {e}")
             self._scanning = False
             self.scan_btn.configure(text="▶ Start scanning")
 
     def _on_adv(self, device, adv):
-        # Filter: accept either by name OR by a valid DUSQ MSD decode.
-        #
-        # Most adv packets on Windows arrive without a name field — the name
-        # lives in the scan response, which only comes through on active
-        # scans, and BleakScanner defaults to passive on this OS.  Name-only
-        # filtering caused this tab to take 5-30 s (or never) to find a
-        # device that the Connect tab sees on the first packet.
-        #
-        # decode_dusq_msd() returning non-None is a strong filter — random
-        # devices using company ID 0xFFFF will fail the decode.
-        name = (device.name or adv.local_name or "").strip()
+        """Detection callback. Captures DUSQ targets always; non-DUSQ devices
+        only when Show-all is enabled (and then with decoded=None)."""
+        name = (device.name or adv.local_name or "").strip() or "(no name)"
         mfd = adv.manufacturer_data or {}
         payload = mfd.get(ADV_MSD_COMPANY_ID)
         decoded = decode_dusq_msd(payload) if payload else None
 
-        name_match = bool(name) and DEVICE_NAME.lower() in name.lower()
+        name_match = (name != "(no name)"
+                      and DEVICE_NAME.lower() in name.lower())
         msd_match  = decoded is not None
-        if not (name_match or msd_match):
+        is_target  = name_match or msd_match
+        # Show-all gate: non-targets only enter the cache when enabled, so
+        # toggling it off later just hides them without re-scanning.
+        if not is_target and not self.show_all.get():
             return
+        # Track the device. We also stash whether it's a DUSQ target so the
+        # render path can colour the row + know whether to show decoded cols.
+        # Bleak occasionally publishes a new transient `device` instance for
+        # the same address; we hold the latest reference for connect().
         self._devices[device.address] = {
-            "rssi":    adv.rssi if adv.rssi is not None else -999,
-            "raw":     bytes(payload) if payload else b"",
-            "decoded": decoded,
-            "seen":    datetime.now(),
+            "name":      name,
+            "device":    device,
+            "rssi":      adv.rssi if adv.rssi is not None else -999,
+            "raw":       bytes(payload) if payload else b"",
+            "decoded":   decoded,
+            "is_target": is_target,
+            "seen":      datetime.now(),
         }
         self.after(0, self._refresh_tree)
 
     def _refresh_tree(self):
-        # Preserve selection across rebuild
+        # Preserve selection across rebuild — keyed by MAC (column index 1
+        # now that Name is the first column).
         sel = self.tree.selection()
-        selected_addr = self.tree.item(sel[0], "values")[0] if sel else None
+        selected_addr = self.tree.item(sel[0], "values")[1] if sel else None
         for row in self.tree.get_children():
             self.tree.delete(row)
+        # Apply Show-all filter at render time so toggling the box doesn't
+        # require a re-scan.
+        rows = [(a, i) for a, i in self._devices.items()
+                if self.show_all.get() or i.get("is_target")]
+        # Sort: targets first, then by RSSI desc. Negative key = strongest signal.
+        rows.sort(key=lambda kv: (not kv[1].get("is_target"), -kv[1]["rssi"]))
         now = datetime.now()
-        for addr, info in sorted(self._devices.items(),
-                                  key=lambda kv: kv[1]["rssi"], reverse=True):
+        target_count = 0
+        for addr, info in rows:
             d = info["decoded"]
             secs_ago = int((now - info["seen"]).total_seconds())
+            name = info.get("name", "(no name)")
+            if info.get("is_target"):
+                target_count += 1
             if d:
                 last_sync_disp = ("never" if d["last_sync"] == 0
                                    else datetime.fromtimestamp(d["last_sync"])
                                         .strftime("%Y-%m-%d %H:%M:%S"))
                 values = (
-                    addr,
+                    name, addr,
                     f"{info['rssi']} dBm",
                     d["state"],
                     "yes" if d["usb"] else "no",
@@ -4447,12 +4988,20 @@ class AdvTab(ttk.Frame):
                     f"{secs_ago}s",
                 )
             else:
-                # DUSQ device without MSD (old firmware?)
-                values = (addr, f"{info['rssi']} dBm", "—", "—", "—", "—", "—",
-                          "—", "—", "—", "—", f"{secs_ago}s")
-            iid = self.tree.insert("", "end", values=values)
+                # Either: DUSQ-named device without MSD payload (old firmware),
+                # or a non-DUSQ device shown in Show-all mode.
+                values = (name, addr, f"{info['rssi']} dBm",
+                          "—", "—", "—", "—", "—", "—", "—", "—", "—",
+                          f"{secs_ago}s")
+            row_tags = ("target",) if info.get("is_target") else ()
+            iid = self.tree.insert("", "end", values=values, tags=row_tags)
             if addr == selected_addr:
                 self.tree.selection_set(iid)
+        # Live counter so the user can see Show-all is doing something.
+        self.scan_status_var.set(
+            f"{'Scanning' if self._scanning else 'Stopped'} · "
+            f"{target_count} target(s) · {len(self._devices)} total"
+            + ("  (showing all)" if self.show_all.get() else ""))
 
     def _redraw_periodic(self):
         if self._devices:
@@ -4460,81 +5009,65 @@ class AdvTab(ttk.Frame):
         self.after(self.REFRESH_MS, self._redraw_periodic)
 
     def _on_select(self, _evt):
-        sel = self.tree.selection()
-        if not sel:
-            self.raw_var.set("(select a row above)")
-            return
-        addr = self.tree.item(sel[0], "values")[0]
-        info = self._devices.get(addr)
-        if not info or not info["raw"]:
-            self.raw_var.set(f"[{addr}]  (no MSD in this device's adv)")
-            return
-        company = ADV_MSD_COMPANY_ID.to_bytes(2, "little")
-        full = company + info["raw"]
-        hex_str = " ".join(f"{b:02X}" for b in full)
-        self.raw_var.set(f"[{addr}]  {hex_str}")
+        # Row selection no longer drives any side-panel since Raw MSD was
+        # removed.  Kept as a no-op binding so future details can hang here.
+        pass
 
     def _clear(self):
         self._devices.clear()
         for row in self.tree.get_children():
             self.tree.delete(row)
-        self.raw_var.set("(select a row above)")
 
-    def _do_manual_decode(self):
-        """Parse a hex string the user pasted (any common format) and show
-        the decoded MSD fields."""
-        raw = self.dec_input_var.get()
-        # Strip "0x"/"0X" prefixes FIRST (their '0' would otherwise be kept and
-        # shift byte alignment), then filter to hex digits only.
-        no_prefix = raw.replace("0x", "").replace("0X", "")
-        cleaned = "".join(ch for ch in no_prefix.lower()
-                          if ch in "0123456789abcdef")
-        if len(cleaned) % 2 != 0:
-            self.dec_output_var.set(f"Error: odd number of hex digits ({len(cleaned)})")
-            return
+    # ----------------------------------------------------------- connect log
+    def _log(self, msg: str):
+        """BLEManager log callback + internal status — drops into the tab's
+        scrolledtext log panel."""
         try:
-            data = bytes.fromhex(cleaned)
-        except ValueError as e:
-            self.dec_output_var.set(f"Error: invalid hex — {e}")
-            return
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", f"[{ts()}] {msg}\n")
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+        except Exception:
+            pass
 
-        # Strip optional 0xFFFF company-ID prefix (2 bytes, little-endian)
-        if len(data) >= ADV_MSD_LEN + 2 and data[0:2] == b"\xFF\xFF":
-            payload = data[2:2 + ADV_MSD_LEN]
-            had_company_id = True
-        elif len(data) >= ADV_MSD_LEN:
-            payload = data[:ADV_MSD_LEN]
-            had_company_id = False
-        else:
-            self.dec_output_var.set(
-                f"Error: need at least {ADV_MSD_LEN} bytes payload "
-                f"(or {ADV_MSD_LEN + 2} with FFFF prefix); got {len(data)}")
+    # ----------------------------------------------------------- connect flow
+    def _on_row_double_click(self, _evt):
+        """Treeview <Double-1> binding — connect to whichever row was just clicked."""
+        sel = self.tree.selection()
+        if not sel:
             return
-
-        d = decode_dusq_msd(payload)
-        if d is None:
-            self.dec_output_var.set("Error: decode failed")
+        # MAC is column 1
+        row_values = self.tree.item(sel[0], "values")
+        if len(row_values) < 2:
             return
+        addr = row_values[1]
+        self._do_connect(addr)
 
-        last_sync_disp = ("never" if d["last_sync"] == 0
-                           else datetime.fromtimestamp(d["last_sync"])
-                                .strftime("%Y-%m-%d %H:%M:%S"))
-        batt_disp = "unknown" if d["batt_pct"] is None else f"{d['batt_pct']}%"
-        hex_str = " ".join(f"{b:02X}" for b in payload)
-        prefix_note = "" if had_company_id else "  (no FFFF prefix detected — assumed payload-only)"
-        text = (
-            f"Bytes (10): {hex_str}{prefix_note}\n"
-            f"  State:         {d['state']} (0x{d['state_id']:X})\n"
-            f"  USB:           {'connected' if d['usb'] else 'disconnected'}\n"
-            f"  Charging:      {'yes' if d['charging'] else 'no'}\n"
-            f"  Lid:           {'closed' if d['lid_closed'] else 'open'}\n"
-            f"  Authenticated: {'yes' if d['authed'] else 'no'}\n"
-            f"  Battery:       {batt_disp}\n"
-            f"  Blocks:        {d['blocks']}\n"
-            f"  Journal:       {d['journal']}\n"
-            f"  Last sync:     {last_sync_disp}"
-        )
-        self.dec_output_var.set(text)
+    def _do_connect(self, addr: str):
+        info = self._devices.get(addr)
+        if info is None:
+            messagebox.showerror("Connect",
+                                  f"Could not find {addr} in scan results.")
+            return
+        dev  = info["device"]
+        name = info.get("name", addr)
+        async def _connect():
+            self.status_var.set(f"Connecting to {name}…")
+            self._log(f"Connecting to {name}  {addr}…")
+            try:
+                await self.ble.connect(dev)
+                self.status_var.set(f"Connected: {name}")
+                self._log("Ready — authenticate via Auth tab.")
+            except Exception as e:
+                self._log(f"Connect failed: {e}")
+                self.status_var.set("Not connected")
+        run_async(_connect())
+
+    def _on_disconnected(self):
+        """BLEManager on_disconnect callback (chained via App)."""
+        self.status_var.set("Not connected")
+        self._log("Connection lost.")
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4637,8 +5170,10 @@ class App(tk.Tk):
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=4, pady=4)
 
-        self.conn_tab    = ConnectionTab(nb, self.ble, self.status_var)
-        self.adv_tab     = AdvTab(nb, self.ble)
+        # Devices tab combines the previous Connect + Adv Data — continuous
+        # passive scan, double-click row to connect, with Show-all toggle for
+        # non-DUSQ adverts.
+        self.adv_tab     = AdvTab(nb, self.ble, self.status_var)
         self.auth_tab    = AuthTab(nb, self.ble)
         self.devinfo_tab = DeviceInfoTab(nb, self.ble)
         self.sens_tab    = SensorTab(nb, self.ble)
@@ -4647,6 +5182,12 @@ class App(tk.Tk):
         self.batt_tab    = BatteryTab(nb, self.ble)
         self.val_tab     = ValidationTab(nb, self.ble)
         self.log_tab     = LogTab(nb, self.event_log)
+
+        # NOTE: Tab vertical scrollability removed — the canvas-wrap fought
+        # Tk's geometry manager at App-init time (window unmapped, canvas
+        # width returns 1) and left content right-shifted.  If a future tab
+        # actually overflows, wrap that ONE tab's overflowing section
+        # locally rather than re-introducing the global wrapper.
 
         # On successful PIN write, auto-subscribe Battery AND auto-read the
         # 5 DIS characteristics so the Device Info tab is populated as soon as
@@ -4665,23 +5206,25 @@ class App(tk.Tk):
         self.ble.add_disconnect_sub(self.batt_tab._on_disconnected)
         self.ble.add_disconnect_sub(self.flash_tab._on_disconnected)
         self.ble.add_disconnect_sub(self.val_tab._on_disconnected)
+        # HapticTab also resets its own _subscribed flag on disconnect so the
+        # next tab-revisit re-subscribes to CHAR_HAPTIC_STAT.
+        if hasattr(self.hap_tab, "_on_disconnected"):
+            self.ble.add_disconnect_sub(self.hap_tab._on_disconnected)
 
-        # Tab order: workflow steps first, comprehensive validation,
-        # then the activity log as the last tab.
-        # Auto-subscribe Haptic status when the user switches to that tab —
-        # the redesigned tab expects a live status indicator without a
-        # manual click.
+        # When the user switches to ANY tab that defines _on_tab_visible(),
+        # dispatch to it.  Lets Battery / Sensor / Haptic auto-subscribe to
+        # their primary notify chars without a manual Subscribe click —
+        # idempotent inside each tab so repeated tab focus does no harm.
         def _on_tab_changed(_evt):
             try:
                 current_tab = nb.nametowidget(nb.select())
-                if current_tab is self.hap_tab and hasattr(self.hap_tab, "_on_tab_visible"):
-                    self.hap_tab._on_tab_visible()
+                if hasattr(current_tab, "_on_tab_visible"):
+                    current_tab._on_tab_visible()
             except Exception:
                 pass
         nb.bind("<<NotebookTabChanged>>", _on_tab_changed)
 
-        nb.add(self.conn_tab,    text="Connect")
-        nb.add(self.adv_tab,     text="Adv Data")
+        nb.add(self.adv_tab,     text="Devices")
         nb.add(self.auth_tab,    text="Auth")
         nb.add(self.devinfo_tab, text="Device Info")
         nb.add(self.sens_tab,    text="Sensors")
@@ -4747,14 +5290,19 @@ class App(tk.Tk):
         """Mirror the shared status string into the top-right indicator
         with a coloured bullet, and morph the right-side button to match
         the current state:
-          Connected   → green   "● Connected: …"     button = ✕ Disconnect
-          Connecting  → yellow  "● Connecting …"     button = disabled
-          Disconnected→ red     "● Disconnected"     button = ↻ Reconnect …
+          Connected   → green   "● Connected: name  MAC"   button = ✕ Disconnect
+          Connecting  → yellow  "● Connecting …"           button = disabled
+          Disconnected→ red     "● Disconnected"           button = ↻ Reconnect …
         """
         text = self.status_var.get()
         lo   = text.lower()
         if lo.startswith("connected"):
-            self.indicator_var.set(f"● {text}")
+            # Append the MAC alongside the name so the user can prove which
+            # physical unit is on the wire. status_var carries "Connected: <name>"
+            # and BLEManager.last_address holds the MAC of the active link.
+            mac = getattr(self.ble, "last_address", None) or ""
+            label = f"● {text}  {mac}" if mac else f"● {text}"
+            self.indicator_var.set(label)
             self.indicator.configure(foreground="#1b8c3a")  # green
             self.reconnect_btn.configure(
                 state="normal",
