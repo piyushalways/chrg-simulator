@@ -8,6 +8,31 @@ blocks, drives the haptic motor, and runs an automated validation suite.
 It uses [bleak](https://github.com/hbldh/bleak) for cross-platform BLE and
 [tkinter](https://docs.python.org/3/library/tkinter.html) for the GUI.
 
+## What's new in this release
+
+- **Validation tab is now "Automated Testing"** — three-region layout:
+  domain checkboxes at top, big RUN button, prominent green/red final
+  result panel. Hover any domain checkbox for a one-line summary of what it
+  tests. The legacy per-test tree view is still available below for
+  fine-grained control. Pre-run dialog shows the estimated time and asks
+  for confirmation before kicking off.
+- **Two new testing domains**:
+  - **Hall** (lid sensor) — I1 verifies lid-close fires the hall event and
+    enables boost; I2 verifies the symmetric lid-open path. Interactive.
+  - **USB detect** — U1 verifies Status.usb flips True on plug-in; U2
+    verifies it flips False on unplug. Interactive.
+- **Live BLE round-trip latency** in the header next to the connection
+  indicator (green < 100 ms, amber < 300 ms, red ≥ 300 ms; sampled every
+  5 s).
+- **Time-sync button on the Auth tab** — mirror of the existing one in the
+  Flash tab. Sync UTC epoch without navigating tabs after authenticating.
+- **Index counters on Flash + Journal downloads**: per-row running index
+  column, plus a tri-counter label showing "On device", "This download",
+  and "This connection" counts.
+- **CSV export** alongside the existing JSON validation export.
+- **Persistent UI state** — window geometry, last-connected device MAC, and
+  device name persist across launches in `~/.dusq_simulator.json`.
+
 ---
 
 ## Index
@@ -24,7 +49,7 @@ It uses [bleak](https://github.com/hbldh/bleak) for cross-platform BLE and
 |   | [4.4 Flash tab](#44-flash-tab)                                        |
 |   | [4.5 Haptic tab](#45-haptic-tab)                                      |
 |   | [4.6 Battery tab](#46-battery-tab)                                    |
-|   | [4.7 Validation tab](#47-validation-tab)                              |
+|   | [4.7 Automated Testing tab](#47-automated-testing-tab)                |
 |   | [4.8 Log tab](#48-log-tab)                                            |
 | 5 | [What gets tested](#5-what-gets-tested)                               |
 | 6 | [BLE protocol reference](#6-ble-protocol-reference)                   |
@@ -340,10 +365,33 @@ from charging to draining (or vice versa) is instantly visible.
 
 [↑ Back to index](#index)
 
-### 4.7 Validation tab
+### 4.7 Automated Testing tab
 
-Comprehensive automated test suite — **44 tests across 8 buckets**, all
-runnable individually, per-bucket, or as a single bulk pass.
+Comprehensive automated test suite — **53 tests across 10 domains**, all
+runnable individually, by domain, or as a single bulk pass.
+
+**Domain layout** (top of tab — checkboxes for what to test):
+
+| Domain | Tests | Notes |
+|---|---|---|
+| BLE          | A1–A6     | scan, connect, MTU, services, disconnect/reconnect cleanup |
+| Auth         | B1        | PIN write + Status-char verify |
+| Sensors      | C1, C2, C5, C7, C8 | cadence, temp, dB, lux, status state |
+| Battery      | D1–D4     | level, cadence, parity, stable during charge |
+| Haptic       | E1–E5     | **interactive** — confirms buzz visually |
+| Flash        | F1–F12    | block count, CRC, sequence, wrap, time-sync effect |
+| Journal      | G1–G7     | count, CRC, monotonic sequence, event types |
+| Hall         | I1, I2    | **interactive** — open/close lid magnet |
+| USB detect   | U1, U2    | **interactive** — plug/unplug USB cable |
+| Long-running | H1, H2    | ≥ 4 h; opt-in only |
+
+The big RUN button below the checkboxes runs whatever is selected.
+"Headless only" pre-selects the non-interactive domains for batch runs.
+Before the run starts, a confirmation modal shows the test count and an
+estimated time so you can abort large jobs.
+
+After the run, the **Latest result** panel turns green ("✓ ALL TESTS
+PASSED") or red (lists failures inline with one-line summaries).
 
 **Layout**
 

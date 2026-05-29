@@ -742,13 +742,23 @@ class AuthTab(ttk.Frame):
                    command=self._compute_pin).grid(row=0, column=2, padx=4)
         ttk.Button(frm, text="Authenticate",
                    command=self._do_auth).grid(row=0, column=3, padx=4)
+        # Time-sync button — mirror of the one on the Flash tab so users can
+        # sync immediately after auth without navigating tabs.  Same backing
+        # logic; writes current UTC epoch to CHAR_TIMESYNC.
+        self.timesync_btn = ttk.Button(frm, text="Send Time Sync (UTC)",
+                                        command=self._do_time_sync)
+        self.timesync_btn.grid(row=0, column=4, padx=(12, 4))
 
         ttk.Label(frm,
                   text="PIN = low 24 bits of CRC32(DIS Serial). Empty → auto-compute on Authenticate.",
-                  foreground="gray").grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 4))
+                  foreground="gray").grid(row=1, column=0, columnspan=5, sticky="w", pady=(2, 4))
 
         self.result_lbl = ttk.Label(frm, text="Status: not authenticated", foreground="gray")
         self.result_lbl.grid(row=2, column=0, columnspan=4, sticky="w", pady=4)
+        # Live "last sync" label updated whenever Send Time Sync succeeds.
+        self.last_sync_var = tk.StringVar(value="Last sync: never")
+        ttk.Label(frm, textvariable=self.last_sync_var,
+                  foreground="#1b8c3a").grid(row=2, column=4, sticky="e", padx=4)
 
         lf = ttk.LabelFrame(self, text="Log", padding=4)
         lf.pack(fill="both", expand=True, padx=6, pady=4)
@@ -885,6 +895,27 @@ class AuthTab(ttk.Frame):
                 foreground="red")
             self._log(f"Auth error: {e}")
 
+    def _do_time_sync(self):
+        """Push the current UTC Unix epoch to CHAR_TIMESYNC.
+        Same logic as the Flash tab's Send Time Sync button — exposed here
+        as well so users can sync immediately after authenticating without
+        navigating away.  Updates the inline 'Last sync' label on success."""
+        if not self.ble.connected:
+            messagebox.showwarning("Time Sync", "Not connected.")
+            return
+        epoch = int(time.time())
+        async def _sync():
+            try:
+                await self.ble.write(CHAR_TIMESYNC, struct.pack("<I", epoch))
+                wall = datetime.fromtimestamp(epoch, tz=timezone.utc)
+                self.last_sync_var.set(f"Last sync: {wall:%H:%M:%S} UTC")
+                self._log(f"Time sync sent: epoch={epoch} "
+                          f"({wall:%Y-%m-%d %H:%M:%S} UTC)")
+            except Exception as e:
+                self._log(f"Time sync error: {e}")
+                messagebox.showerror("Time Sync", str(e))
+        run_async(_sync())
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Sensor Monitor tab
@@ -900,6 +931,7 @@ class SensorTab(ttk.Frame):
         # Live value StringVars
         self.sv_temp     = tk.StringVar(value="--")
         self.sv_db       = tk.StringVar(value="--")
+        self.sv_peak_db  = tk.StringVar(value="--")
         self.sv_lux      = tk.StringVar(value="--")
         self.sv_batt     = tk.StringVar(value="--")
         self.sv_status   = tk.StringVar(value="--")
@@ -925,7 +957,8 @@ class SensorTab(ttk.Frame):
         vf.pack(fill="x", padx=6, pady=2)
         fields = [
             ("Temperature (°C)",  self.sv_temp),
-            ("dB",                self.sv_db),
+            ("dB (avg)",          self.sv_db),
+            ("dB (peak)",         self.sv_peak_db),
             ("Lux",               self.sv_lux),
             ("Battery %",         self.sv_batt),
             ("System Status",     self.sv_status),
@@ -993,7 +1026,7 @@ class SensorTab(ttk.Frame):
         Wired up by App via BLEManager.add_disconnect_sub()."""
         for lst in (self.hist_temp, self.hist_db, self.hist_lux):
             lst.clear()
-        for sv in (self.sv_temp, self.sv_db,
+        for sv in (self.sv_temp, self.sv_db, self.sv_peak_db,
                    self.sv_lux, self.sv_batt, self.sv_status):
             sv.set("--")
         if HAS_MPL:
@@ -1041,13 +1074,14 @@ class SensorTab(ttk.Frame):
                 pass
 
     def _on_sensor(self, _h, data: bytearray):
-        """Single notify on the merged sensor char (0x1526), 4 bytes:
-           [int8 temp, uint8 db, uint16 LE lux]."""
-        if len(data) < 4:
+        """Single notify on the merged sensor char (0x1526), 5 bytes:
+           [int8 temp, uint8 db, uint8 peak_db, uint16 LE lux]."""
+        if len(data) < 5:
             return
-        temp, db, lux = struct.unpack_from("<bBH", data)
+        temp, db, peak_db, lux = struct.unpack_from("<bBBH", data)
         self.sv_temp.set("ERR" if temp == TEMP_ERROR else str(temp))
         self.sv_db.set("ERR" if db == DB_ERROR else str(db))
+        self.sv_peak_db.set("ERR" if peak_db == DB_ERROR else str(peak_db))
         self.sv_lux.set("ERR" if lux == LUX_ERROR else str(lux))
         self._push_reading()
 
@@ -1084,10 +1118,11 @@ class SensorTab(ttk.Frame):
         async def _read():
             try:
                 sensor_raw = await self.ble.read(CHAR_SENSOR_DATA)
-                if len(sensor_raw) >= 4:
-                    temp, db, lux = struct.unpack_from("<bBH", sensor_raw)
+                if len(sensor_raw) >= 5:
+                    temp, db, peak_db, lux = struct.unpack_from("<bBBH", sensor_raw)
                     self.sv_temp.set("ERR" if temp == TEMP_ERROR else str(temp))
                     self.sv_db.set("ERR" if db == DB_ERROR else str(db))
+                    self.sv_peak_db.set("ERR" if peak_db == DB_ERROR else str(peak_db))
                     self.sv_lux.set("ERR" if lux == LUX_ERROR else str(lux))
 
                 batt = (await self.ble.read(CHAR_BATT_LEVEL))[0]
@@ -1124,11 +1159,17 @@ class FlashTab(ttk.Frame):
         self._blocks: List[dict] = []
         self._dl_task: Optional[asyncio.Task] = None
         self._dl_idle_evt: Optional[asyncio.Event] = None
+        # Running counters — "this download" resets every time the user
+        # clicks Download; "this connection" resets only on disconnect.
+        self._blk_session_count = 0
+        self._blk_connection_count = 0
 
         # Journal state
         self._journal: List[dict] = []
         self._jnl_task: Optional[asyncio.Task] = None
         self._jnl_idle_evt: Optional[asyncio.Event] = None
+        self._jnl_session_count = 0
+        self._jnl_connection_count = 0
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=4, pady=4)
@@ -1159,17 +1200,22 @@ class FlashTab(ttk.Frame):
         ttk.Button(ctrl, text="Clear List",
                    command=self._do_clear_blocks).pack(side="left", padx=4)
 
-        self.count_lbl = ttk.Label(ctrl, text="Blocks on device: ?  /  "
-                                              "Downloaded: 0")
+        self.count_lbl = ttk.Label(
+            ctrl,
+            text="On device: ?   |   This download: 0   |   This connection: 0")
         self.count_lbl.pack(side="left", padx=12)
 
         # Block list
         lf = ttk.LabelFrame(page, text="Downloaded Blocks", padding=4)
         lf.pack(fill="both", expand=True, padx=6, pady=2)
 
-        cols = ("seq", "timestamp", "sync", "readings", "crc")
+        # "#" is a running index in this list — first row received in the
+        # current connection = 1, increments per row.  Distinct from device
+        # "seq" which is the firmware's block sequence number.
+        cols = ("idx", "seq", "timestamp", "sync", "readings", "crc")
         self.tree = ttk.Treeview(lf, columns=cols, show="headings", height=7)
         for col, w, hdr, anchor in [
+            ("idx",       50,  "#",         "center"),
             ("seq",       60,  "Seq",       "center"),
             ("timestamp", 200, "Timestamp", "w"),
             ("sync",      70,  "Sync",      "center"),
@@ -1216,16 +1262,18 @@ class FlashTab(ttk.Frame):
                    command=self._do_clear_journal).pack(side="left", padx=4)
 
         self.jnl_count_lbl = ttk.Label(
-            ctrl, text="Entries on device: ?  /  Downloaded: 0")
+            ctrl,
+            text="On device: ?   |   This download: 0   |   This connection: 0")
         self.jnl_count_lbl.pack(side="left", padx=12)
 
         lf = ttk.LabelFrame(page, text="Journal Entries", padding=4)
         lf.pack(fill="both", expand=True, padx=6, pady=2)
 
-        cols = ("seq", "type", "timestamp", "data", "crc")
+        cols = ("idx", "seq", "type", "timestamp", "data", "crc")
         self.jnl_tree = ttk.Treeview(lf, columns=cols, show="headings",
                                       height=8)
         for col, w, hdr, anchor in [
+            ("idx",       50,  "#",           "center"),
             ("seq",       60,  "Seq",         "center"),
             ("type",      120, "Event",       "w"),
             ("timestamp", 100, "Timestamp",   "center"),
@@ -1278,8 +1326,9 @@ class FlashTab(ttk.Frame):
                 raw = await self.ble.read(CHAR_BLOCK_COUNT)
                 n = struct.unpack("<H", raw)[0]
                 self.count_lbl.configure(
-                    text=f"Blocks on device: {n}  /  "
-                         f"Downloaded: {len(self._blocks)}")
+                    text=f"On device: {n}   |   "
+                         f"This download: {self._blk_session_count}   |   "
+                         f"This connection: {self._blk_connection_count}")
             except Exception as e:
                 messagebox.showerror("Count", str(e))
         run_async(_count())
@@ -1302,10 +1351,13 @@ class FlashTab(ttk.Frame):
 
     def _do_clear_blocks(self):
         self._blocks.clear()
+        self._blk_session_count = 0
+        self._blk_connection_count = 0
         for row in self.tree.get_children():
             self.tree.delete(row)
         self._set_box(self.detail_box, "")
-        self.count_lbl.configure(text="Blocks on device: ?  /  Downloaded: 0")
+        self.count_lbl.configure(
+            text="On device: ?   |   This download: 0   |   This connection: 0")
 
     def _do_download(self):
         """Subscribe to notify FIRST, then write 0x01 trigger.
@@ -1314,6 +1366,8 @@ class FlashTab(ttk.Frame):
         if not self.ble.connected:
             messagebox.showwarning("Flash", "Not connected.")
             return
+        # Reset the per-download counter; per-connection counter stays.
+        self._blk_session_count = 0
         if self._dl_task and not self._dl_task.done():
             return  # already running
 
@@ -1330,15 +1384,20 @@ class FlashTab(ttk.Frame):
                 if blk is None:
                     continue
                 self._blocks.append(blk)
+                self._blk_session_count += 1
+                self._blk_connection_count += 1
                 tag = "" if blk["crc_ok"] else "bad"
                 self.tree.insert("", "end",
-                                 values=(blk["sequence"], blk["timestamp"],
+                                 values=(self._blk_connection_count,
+                                         blk["sequence"], blk["timestamp"],
                                          "post" if blk["sync_status"] else "pre",
                                          blk["reading_count"],
                                          "OK" if blk["crc_ok"] else "FAIL"),
                                  tags=(tag,) if tag else ())
                 self.count_lbl.configure(
-                    text=f"Downloaded: {len(self._blocks)} block(s)")
+                    text=f"On device: ?   |   "
+                         f"This download: {self._blk_session_count}   |   "
+                         f"This connection: {self._blk_connection_count}")
             # Reset the silence timer on every chunk; thread-safe call.
             loop.call_soon_threadsafe(self._dl_idle_evt.set)
 
@@ -1423,19 +1482,22 @@ class FlashTab(ttk.Frame):
                 raw = await self.ble.read(CHAR_JOURNAL_COUNT)
                 n = struct.unpack("<H", raw)[0]
                 self.jnl_count_lbl.configure(
-                    text=f"Entries on device: {n}  /  "
-                         f"Downloaded: {len(self._journal)}")
+                    text=f"On device: {n}   |   "
+                         f"This download: {self._jnl_session_count}   |   "
+                         f"This connection: {self._jnl_connection_count}")
             except Exception as e:
                 messagebox.showerror("Journal Count", str(e))
         run_async(_count())
 
     def _do_clear_journal(self):
         self._journal.clear()
+        self._jnl_session_count = 0
+        self._jnl_connection_count = 0
         for row in self.jnl_tree.get_children():
             self.jnl_tree.delete(row)
         self._set_box(self.jnl_detail_box, "")
         self.jnl_count_lbl.configure(
-            text="Entries on device: ?  /  Downloaded: 0")
+            text="On device: ?   |   This download: 0   |   This connection: 0")
 
     def _do_journal_download(self):
         """Subscribe to JOURNAL_RECORD (notify-only), THEN write 0x01 to
@@ -1443,6 +1505,8 @@ class FlashTab(ttk.Frame):
         if not self.ble.connected:
             messagebox.showwarning("Flash", "Not connected.")
             return
+        # Reset per-download counter; per-connection counter stays.
+        self._jnl_session_count = 0
         if self._jnl_task and not self._jnl_task.done():
             return
 
@@ -1459,16 +1523,21 @@ class FlashTab(ttk.Frame):
                 if e is None:
                     continue
                 self._journal.append(e)
+                self._jnl_session_count += 1
+                self._jnl_connection_count += 1
                 tag = "" if e["crc_ok"] else "bad"
                 self.jnl_tree.insert(
                     "", "end",
-                    values=(e["sequence"], e["type_str"], e["timestamp"],
+                    values=(self._jnl_connection_count,
+                            e["sequence"], e["type_str"], e["timestamp"],
                             f"0x{e['data']:08X} ({e['data']})",
                             "OK" if e["crc_ok"] else "FAIL"),
                     tags=(tag,) if tag else (),
                 )
                 self.jnl_count_lbl.configure(
-                    text=f"Downloaded: {len(self._journal)} entry(ies)")
+                    text=f"On device: ?   |   "
+                         f"This download: {self._jnl_session_count}   |   "
+                         f"This connection: {self._jnl_connection_count}")
             loop.call_soon_threadsafe(self._jnl_idle_evt.set)
 
         async def _dl():
@@ -1630,7 +1699,23 @@ class ValidationTab(ttk.Frame):
         "E": "Haptic",
         "F": "Flash sensor blocks + circular buffer",
         "G": "Journal",
+        "I": "Hall (lid sensor)",
+        "U": "USB detect",
         "H": "Long-running (opt-in, ≥4 h)",
+    }
+    # User-friendly domain labels for the checkbox UI.  Maps domain code →
+    # (display label, requires-physical-interaction flag).
+    DOMAIN_LABELS = {
+        "A": ("BLE",        False),
+        "B": ("Auth",       False),
+        "C": ("Sensors",    False),
+        "D": ("Battery",    False),
+        "E": ("Haptic",     True),
+        "F": ("Flash",      False),
+        "G": ("Journal",    False),
+        "I": ("Hall",       True),
+        "U": ("USB detect", True),
+        "H": ("Long-running", False),
     }
 
     def __init__(self, parent, ble: BLEManager):
@@ -1668,8 +1753,10 @@ class ValidationTab(ttk.Frame):
                                       command=self._on_cancel,
                                       state="disabled")
         self.cancel_btn.pack(side="left", padx=2)
-        ttk.Button(top, text="Export…",
+        ttk.Button(top, text="Export JSON",
                    command=self._on_export).pack(side="left", padx=2)
+        ttk.Button(top, text="Export CSV",
+                   command=self._on_export_csv).pack(side="left", padx=2)
         ttk.Button(top, text="Reset",
                    command=self._on_reset).pack(side="left", padx=2)
 
@@ -1677,8 +1764,97 @@ class ValidationTab(ttk.Frame):
         ttk.Checkbutton(top, text="Include long-running (Bucket H)",
                         variable=self.include_long_var).pack(side="right", padx=4)
 
-        # Tree of tests
-        tree_lf = ttk.LabelFrame(self, text="Test catalogue", padding=4)
+        # ── Domain quick-select panel ────────────────────────────────────────
+        # User taps domain checkboxes to choose what to test, then hits the
+        # big RUN button.  Hovering a checkbox updates a one-line info hint
+        # below.  Matches the "Automated Testing" UX in the plan.
+        dom_lf = ttk.LabelFrame(self, text="Tap to choose what to test",
+                                 padding=8)
+        dom_lf.pack(fill="x", padx=6, pady=4)
+        self.domain_vars: Dict[str, tk.BooleanVar] = {}
+        # Test count per domain — built from the catalogue at construction.
+        domain_counts: Dict[str, int] = {}
+        for s in self._catalogue:
+            domain_counts[s.bucket] = domain_counts.get(s.bucket, 0) + 1
+        # Build checkboxes in display order: BLE, Auth, Sensors, Battery,
+        # Haptic, Flash, Journal, Hall, USB detect, Long-running.
+        domain_order = ["A", "B", "C", "D", "E", "F", "G", "I", "U", "H"]
+        col, row = 0, 0
+        for code in domain_order:
+            if code not in self.DOMAIN_LABELS:
+                continue
+            label, manual = self.DOMAIN_LABELS[code]
+            count = domain_counts.get(code, 0)
+            # Long-running starts off; everything else on.
+            initial = (code != "H")
+            var = tk.BooleanVar(value=initial)
+            self.domain_vars[code] = var
+            text = f"{label} ({count})"
+            if manual:
+                text += "  [manual]"
+            cb = ttk.Checkbutton(dom_lf, text=text, variable=var,
+                                  command=self._on_domain_toggle)
+            cb.grid(row=row, column=col, sticky="w", padx=8, pady=2)
+            # Hover binding — show domain description in the hint label.
+            cb.bind("<Enter>", lambda _e, c=code: self._show_domain_hint(c))
+            cb.bind("<Leave>", lambda _e: self._show_domain_hint(None))
+            col += 1
+            if col >= 3:
+                col, row = 0, row + 1
+        # Hint label below the checkboxes — pinned inside a fixed-height
+        # frame so the surrounding layout doesn't reflow when the hint text
+        # length changes between checkboxes (some hints are short, some
+        # wrap to two lines).  grid_propagate(False) freezes the frame's
+        # outer size regardless of the label's natural height.
+        self.domain_hint_var = tk.StringVar(
+            value="Hover any checkbox to see what tests it covers.")
+        hint_frame = ttk.Frame(dom_lf, height=44)
+        hint_frame.grid(row=row + 1, column=0, columnspan=3,
+                         sticky="ew", pady=(6, 2))
+        hint_frame.grid_propagate(False)
+        hint_frame.columnconfigure(0, weight=1)
+        ttk.Label(hint_frame, textvariable=self.domain_hint_var,
+                  foreground="#34495e",
+                  wraplength=720,
+                  anchor="nw", justify="left"
+                 ).grid(row=0, column=0, sticky="nsew")
+
+        # Big RUN button + quick selectors.
+        run_row = ttk.Frame(dom_lf)
+        run_row.grid(row=row + 2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.big_run_btn = tk.Button(run_row,
+                                      text="▶ RUN selected domains",
+                                      command=self._on_run_domains,
+                                      bg="#1b8c3a", fg="white",
+                                      activebackground="#1b8c3a",
+                                      activeforeground="white",
+                                      font=("Segoe UI", 10, "bold"),
+                                      relief="raised", bd=2)
+        self.big_run_btn.pack(side="left", padx=4)
+        ttk.Button(run_row, text="Select all",
+                   command=self._domains_select_all).pack(side="left", padx=2)
+        ttk.Button(run_row, text="Headless only",
+                   command=self._domains_headless_only).pack(side="left", padx=2)
+        ttk.Button(run_row, text="Clear",
+                   command=self._domains_clear).pack(side="left", padx=2)
+
+        # ── Final result region (filled in after a run completes) ────────────
+        self.result_frame = ttk.LabelFrame(self, text="Latest result",
+                                            padding=10)
+        self.result_frame.pack(fill="x", padx=6, pady=4)
+        self.result_var = tk.StringVar(value="(no runs yet)")
+        self.result_lbl = ttk.Label(self.result_frame,
+                                     textvariable=self.result_var,
+                                     font=("Segoe UI", 11, "bold"),
+                                     foreground="#7f8c8d")
+        self.result_lbl.pack(anchor="w")
+        self.result_detail_var = tk.StringVar(value="")
+        ttk.Label(self.result_frame, textvariable=self.result_detail_var,
+                  foreground="#34495e", wraplength=720,
+                  font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+
+        # Tree of tests (for fine-grained per-test selection, still useful)
+        tree_lf = ttk.LabelFrame(self, text="Per-test detail (advanced)", padding=4)
         tree_lf.pack(fill="both", expand=True, padx=6, pady=2)
 
         cols = ("status", "duration")
@@ -1808,6 +1984,108 @@ class ValidationTab(ttk.Frame):
 
     # ── button handlers ──────────────────────────────────────────────────────
 
+    # ── Domain checkbox panel handlers ──────────────────────────────────────
+
+    DOMAIN_HINTS = {
+        "A": "BLE — scan visibility, connect handshake, MTU, services, characteristics, disconnect/reconnect cleanup.",
+        "B": "Auth — PIN write via CRC32-of-serial, verified by reading the Status characteristic.",
+        "C": "Sensors — temperature, dB, lux, status state, 60 s update cadence (test-mode tolerant).",
+        "D": "Battery — level in 0–100, 60 s updates, parity with Status char, stability while charging.",
+        "E": "Haptic — motor on/off, intensity persistence, intensity clamp, countdown timer.  Requires you to confirm the buzz.",
+        "F": "Flash — block count, CRC, reading count, sync pointer, sequence invariants, wrap audit trail, payload decode, time-sync effect.",
+        "G": "Journal — count, CRC, monotonic sequence, valid event types, BOOT/TIME_SYNC/WRAP entries.",
+        "I": "Hall — lid close fires hall event + enables boost; lid open does the reverse.  Requires you to physically move a magnet.",
+        "U": "USB detect — Status.usb flips True on plug-in, False on unplug.  Requires you to plug/unplug a USB cable.",
+        "H": "Long-running — ≥ 4 hour wrap watcher + connection uptime stress.  Opt in only when you have time to wait.",
+    }
+
+    def _show_domain_hint(self, code: Optional[str]):
+        if code is None or code not in self.DOMAIN_HINTS:
+            self.domain_hint_var.set(
+                "Hover any checkbox to see what tests it covers.")
+            return
+        self.domain_hint_var.set(self.DOMAIN_HINTS[code])
+
+    def _on_domain_toggle(self):
+        """Update the big RUN button label whenever any domain checkbox flips,
+        so the operator can see at a glance how many tests will run."""
+        ids = self._collect_domain_ids()
+        n = len(ids)
+        # Rough time estimate (matches _kick_off heuristic).
+        interactive = ("E", "I", "U")
+        n_int  = sum(1 for tid in ids if tid[:1] in interactive)
+        n_long = sum(1 for tid in ids
+                      if self._spec_by_id.get(tid)
+                      and self._spec_by_id[tid].optional)
+        n_hl   = max(0, n - n_int - n_long)
+        secs   = n_hl * 10 + n_int * 30
+        if n_long > 0:
+            tstr = f"≥{4 * n_long} h"
+        elif secs >= 60:
+            tstr = f"~{secs // 60} min"
+        else:
+            tstr = f"~{secs} s"
+        self.big_run_btn.configure(
+            text=f"▶ RUN  ({n} tests · {tstr})")
+
+    def _collect_domain_ids(self) -> List[str]:
+        """Return all test_ids belonging to currently-checked domains."""
+        ids: List[str] = []
+        for s in self._catalogue:
+            if self.domain_vars.get(s.bucket) and self.domain_vars[s.bucket].get():
+                ids.append(s.test_id)
+        return ids
+
+    def _on_run_domains(self):
+        ids = self._collect_domain_ids()
+        if not ids:
+            messagebox.showinfo("Run", "No domains selected.")
+            return
+        self._kick_off(ids)
+
+    def _domains_select_all(self):
+        for v in self.domain_vars.values():
+            v.set(True)
+        self._on_domain_toggle()
+
+    def _domains_headless_only(self):
+        """Un-check domains that require physical interaction (E, I, U) and
+        long-running (H).  Leaves the headless set ready to run."""
+        for code, var in self.domain_vars.items():
+            _, manual = self.DOMAIN_LABELS.get(code, ("", False))
+            var.set(not manual and code != "H")
+        self._on_domain_toggle()
+
+    def _domains_clear(self):
+        for v in self.domain_vars.values():
+            v.set(False)
+        self._on_domain_toggle()
+
+    def _update_result_region(self):
+        """Repaint the big green/red final-result label after a run completes.
+        Driven from _on_run_done / cancel paths."""
+        if self._ctx is None or not self._ctx.results:
+            self.result_var.set("(no runs yet)")
+            self.result_lbl.configure(foreground="#7f8c8d")
+            self.result_detail_var.set("")
+            return
+        results = self._ctx.results
+        total = len(results)
+        passed = sum(1 for r in results.values() if r.status == "PASS")
+        failed = [(tid, r) for tid, r in results.items() if r.status == "FAIL"]
+        if not failed:
+            self.result_var.set(f"✓  ALL TESTS PASSED  ({passed}/{total})")
+            self.result_lbl.configure(foreground="#1b8c3a")
+            self.result_detail_var.set("")
+        else:
+            self.result_var.set(f"✗  {len(failed)} OF {total} TESTS FAILED")
+            self.result_lbl.configure(foreground="#c0392b")
+            lines = [f"• {tid} — {(r.summary or '').splitlines()[0][:120]}"
+                     for tid, r in failed[:8]]
+            if len(failed) > 8:
+                lines.append(f"… and {len(failed) - 8} more")
+            self.result_detail_var.set("\n".join(lines))
+
     def _on_run_all(self):
         ids = [s.test_id for s in self._catalogue
                 if not s.optional or self.include_long_var.get()]
@@ -1884,6 +2162,38 @@ class ValidationTab(ttk.Frame):
         except Exception as e:
             messagebox.showerror("Export", str(e))
 
+    def _on_export_csv(self):
+        """Write a CSV with one row per test for spreadsheet-friendly analysis.
+        Columns: test_id, bucket, name, status, duration_ms, summary."""
+        if self._ctx is None or not self._ctx.results:
+            messagebox.showinfo("Export",
+                                "No run results yet — run tests first.")
+            return
+        ts_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+        try:
+            out_dir = Path(__file__).resolve().parent / "__pycache__"
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            out_dir = Path(".")
+        path = out_dir / f"dusq_validation_{ts_str}.csv"
+        try:
+            import csv
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["test_id", "bucket", "name",
+                            "status", "duration_ms", "summary"])
+                for tid, r in self._ctx.results.items():
+                    spec = self._spec_by_id.get(tid)
+                    bucket = spec.bucket if spec else ""
+                    name   = spec.name if spec else ""
+                    # Replace newlines in summary to keep CSV row count sane.
+                    summary = (r.summary or "").replace("\n", " | ")
+                    w.writerow([tid, bucket, name,
+                                r.status, r.duration_ms, summary])
+            messagebox.showinfo("Export", f"Wrote {path}")
+        except Exception as e:
+            messagebox.showerror("Export CSV", str(e))
+
     def _on_reset(self):
         for tid in self._row_iid:
             self._set_row_status(tid, "PENDING")
@@ -1898,6 +2208,34 @@ class ValidationTab(ttk.Frame):
         if self._run_task and not self._run_task.done():
             messagebox.showwarning("Validation", "A run is already in progress.")
             return
+
+        # Pre-run summary dialog — gives the operator a quick check before
+        # we kick off a long batch.  Estimates total time using:
+        #   ~30 s per interactive test (E*, H*, U*)
+        #   ~10 s per headless test
+        #   long-running (optional=True) entries: ≥ 4 hours each
+        interactive_prefixes = ("E", "H", "U")
+        n_interactive = sum(1 for tid in requested_ids
+                            if tid[:1] in interactive_prefixes)
+        n_longrunning = sum(1 for tid in requested_ids
+                            if self._spec_by_id.get(tid)
+                            and self._spec_by_id[tid].optional)
+        n_headless    = max(0, len(requested_ids) - n_interactive - n_longrunning)
+        est_sec       = n_headless * 10 + n_interactive * 30
+        if n_longrunning > 0:
+            time_str = f"≥ {4 * n_longrunning} hour(s) (long-running included)"
+        elif est_sec >= 60:
+            time_str = f"~{est_sec // 60} min {est_sec % 60} sec"
+        else:
+            time_str = f"~{est_sec} sec"
+        msg = (f"About to run {len(requested_ids)} test(s):\n\n"
+               f"  • {n_headless} headless\n"
+               f"  • {n_interactive} require physical interaction\n"
+               + (f"  • {n_longrunning} long-running (≥ 4 h each)\n" if n_longrunning else "")
+               + f"\nEstimated time: {time_str}\n\nContinue?")
+        if not messagebox.askokcancel("Run plan", msg):
+            return
+
         # Resolve dependencies (transitive closure via BFS)
         resolved: List[str] = []
         seen = set()
@@ -1997,6 +2335,11 @@ class ValidationTab(ttk.Frame):
             self.run_all_btn.configure(state="normal")
             self.run_sel_btn.configure(state="normal")
             self.run_bkt_btn.configure(state="normal")
+            # Refresh the big green/red result label on the new UX panel.
+            try:
+                self._update_result_region()
+            except Exception:
+                pass
 
     # ── shared collection helpers (cached per ctx) ───────────────────────────
 
@@ -2010,18 +2353,20 @@ class ValidationTab(ttk.Frame):
         evt = asyncio.Event()
 
         def _on_sensor(_h, data: bytearray):
-            if len(data) < 4:
+            if len(data) < 5:
                 return
-            temp, db, lux = struct.unpack_from("<bBH", data)
+            temp, db, peak_db, lux = struct.unpack_from("<bBBH", data)
             entry = {
-                "temp":  None if temp == TEMP_ERROR else temp,
-                "db":    None if db   == DB_ERROR   else db,
-                "lux":   None if lux  == LUX_ERROR  else lux,
-                "ts":    time.time(),
+                "temp":    None if temp == TEMP_ERROR else temp,
+                "db":      None if db   == DB_ERROR   else db,
+                "peak_db": None if peak_db == DB_ERROR else peak_db,
+                "lux":     None if lux  == LUX_ERROR  else lux,
+                "ts":      time.time(),
             }
             ctx.samples.append(entry)
             ctx.detail(f"  sample {len(ctx.samples)}/{n}: "
-                        f"t={entry['temp']}°C  db={entry['db']}  "
+                        f"t={entry['temp']}°C  db={entry['db']} "
+                        f"(peak {entry['peak_db']})  "
                         f"lux={entry['lux']}")
             if len(ctx.samples) >= n:
                 evt.set()
@@ -2211,6 +2556,16 @@ class ValidationTab(ttk.Frame):
             T("G5", "G", "Time sync logged in journal",         self._t_G5, ("F10", "G2")),
             T("G6", "G", "Wrap entries reference valid blocks", self._t_G6, ("G2",)),
             T("G7", "G", "Boot event present in journal",       self._t_G7, ("G2",)),
+
+            # ── Bucket I — Hall (lid sensor) — interactive ─────────────────
+            T("I1", "I", "Lid close fires hall event (boost ON)",
+                self._t_I1, ("B1",)),
+            T("I2", "I", "Lid open fires hall event (boost OFF)",
+                self._t_I2, ("B1",)),
+
+            # ── Bucket U — USB detect — interactive ────────────────────────
+            T("U1", "U", "USB plug-in detected",  self._t_U1, ("B1",)),
+            T("U2", "U", "USB unplug detected",   self._t_U2, ("B1",)),
 
             # ── Bucket H — Long-running (opt-in) ───────────────────────────
             T("H1", "H", "Wrap watcher (4+ hours)",  self._t_H1, ("F2",), True),
@@ -2994,6 +3349,144 @@ class ValidationTab(ttk.Frame):
     async def _t_H2(self, ctx):
         return self._mk("H2", "INCONCLUSIVE",
                          "connection_uptime: not implemented in Pass 1")
+
+    # ─── Bucket I — Hall (lid sensor) — interactive ──────────────────────────
+
+    async def _t_I1(self, ctx):
+        """Hall close → boost ON.
+
+        Procedure: prompt user to close the lid magnet against the device,
+        then read Status char.  PASS if lid_closed flag flipped to True
+        within ~5 seconds AND boost flag is also True (assuming battery
+        is above BATT_LOW_MV — otherwise boost stays disabled by guard).
+        """
+        try:
+            # Snapshot pre-event state for reference.
+            pre = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            ctx.detail(f"pre-event: lid_closed={pre.get('lid_closed')}  "
+                        f"boost={pre.get('boost')}")
+            ok_action = await self._ask_pass_fail(
+                "I1 Lid close fires hall event",
+                "Please CLOSE the lid magnet against the device now.\n\n"
+                "When done, click Pass and I'll read the Status char to "
+                "verify the device saw the event.")
+            if not ok_action:
+                return self._mk("I1", "FAIL",
+                                 "user cancelled before performing action")
+
+            # Give firmware a moment to update Status after the event.
+            await asyncio.sleep(0.5)
+            post = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            ctx.detail(f"post-event: lid_closed={post.get('lid_closed')}  "
+                        f"boost={post.get('boost')}")
+
+            lid_now    = bool(post.get("lid_closed"))
+            boost_now  = bool(post.get("boost"))
+            if not lid_now:
+                return self._mk("I1", "FAIL",
+                                 "lid_closed flag did not flip to True")
+            # Boost SHOULD turn on at lid-close (unless battery too low).
+            note = " (boost gated low-batt?)" if not boost_now else ""
+            return self._mk("I1", "PASS",
+                             f"lid_closed=True, boost={boost_now}{note}",
+                             [f"pre:  {pre}", f"post: {post}"])
+        except Exception as e:
+            return self._mk("I1", "FAIL", f"error: {e}")
+
+    async def _t_I2(self, ctx):
+        """Hall open → boost OFF."""
+        try:
+            pre = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            ctx.detail(f"pre-event: lid_closed={pre.get('lid_closed')}  "
+                        f"boost={pre.get('boost')}")
+            ok_action = await self._ask_pass_fail(
+                "I2 Lid open fires hall event",
+                "Please OPEN the lid (remove the magnet from the device).\n\n"
+                "Then click Pass and I'll verify the device saw the "
+                "lid-open transition.")
+            if not ok_action:
+                return self._mk("I2", "FAIL",
+                                 "user cancelled before performing action")
+
+            await asyncio.sleep(0.5)
+            post = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            ctx.detail(f"post-event: lid_closed={post.get('lid_closed')}  "
+                        f"boost={post.get('boost')}")
+
+            lid_now    = bool(post.get("lid_closed"))
+            boost_now  = bool(post.get("boost"))
+            if lid_now:
+                return self._mk("I2", "FAIL",
+                                 "lid_closed flag did not flip to False")
+            if boost_now:
+                return self._mk("I2", "FAIL",
+                                 "boost stayed ON after lid open")
+            return self._mk("I2", "PASS",
+                             "lid_closed=False, boost=False",
+                             [f"pre:  {pre}", f"post: {post}"])
+        except Exception as e:
+            return self._mk("I2", "FAIL", f"error: {e}")
+
+    # ─── Bucket U — USB detect — interactive ─────────────────────────────────
+
+    async def _t_U1(self, ctx):
+        """USB plug-in detected — Status.usb flips True within 2 s."""
+        try:
+            pre = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            ctx.detail(f"pre-event: usb={pre.get('usb')}")
+            if pre.get("usb"):
+                return self._mk("U1", "FAIL",
+                                 "USB already detected as connected pre-test "
+                                 "— unplug first, then re-run")
+            ok_action = await self._ask_pass_fail(
+                "U1 USB plug-in",
+                "Please PLUG the USB cable into the device now.\n\n"
+                "Then click Pass and I'll verify the device detected it.")
+            if not ok_action:
+                return self._mk("U1", "FAIL",
+                                 "user cancelled before performing action")
+
+            await asyncio.sleep(0.5)
+            post = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            ctx.detail(f"post-event: usb={post.get('usb')}")
+            if not post.get("usb"):
+                return self._mk("U1", "FAIL",
+                                 "Status.usb did not flip to True after plug-in")
+            return self._mk("U1", "PASS",
+                             "usb=True observed",
+                             [f"pre:  {pre}", f"post: {post}"])
+        except Exception as e:
+            return self._mk("U1", "FAIL", f"error: {e}")
+
+    async def _t_U2(self, ctx):
+        """USB unplug detected — Status.usb flips False within 2 s."""
+        try:
+            pre = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            ctx.detail(f"pre-event: usb={pre.get('usb')}")
+            if not pre.get("usb"):
+                return self._mk("U2", "FAIL",
+                                 "USB not currently detected as connected — "
+                                 "plug in first, then re-run")
+            ok_action = await self._ask_pass_fail(
+                "U2 USB unplug",
+                "Please UNPLUG the USB cable from the device now.\n\n"
+                "Then click Pass and I'll verify the device detected the "
+                "unplug.")
+            if not ok_action:
+                return self._mk("U2", "FAIL",
+                                 "user cancelled before performing action")
+
+            await asyncio.sleep(0.5)
+            post = decode_status(bytes(await self.ble.read(CHAR_STATUS)))
+            ctx.detail(f"post-event: usb={post.get('usb')}")
+            if post.get("usb"):
+                return self._mk("U2", "FAIL",
+                                 "Status.usb did not flip to False after unplug")
+            return self._mk("U2", "PASS",
+                             "usb=False observed",
+                             [f"pre:  {pre}", f"post: {post}"])
+        except Exception as e:
+            return self._mk("U2", "FAIL", f"error: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4048,15 +4541,56 @@ class AdvTab(ttk.Frame):
 #  Main application
 # ─────────────────────────────────────────────────────────────────────────────
 
+STATE_FILE = Path.home() / ".dusq_simulator.json"
+
+
+def _load_state() -> dict:
+    """Load persisted UI state from ~/.dusq_simulator.json.
+
+    Returns an empty dict if the file is missing or unparseable.  Schema is
+    intentionally loose — unknown keys are ignored so older clients can read
+    newer files (and vice versa) without crashing."""
+    try:
+        if STATE_FILE.exists():
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_state(state: dict) -> None:
+    """Write the persisted UI state dict to ~/.dusq_simulator.json.
+    Best-effort — silently swallows errors (read-only home dir, etc.) so
+    a save failure never blocks app shutdown."""
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 class App(tk.Tk):
     def __init__(self, loop: asyncio.AbstractEventLoop):
         super().__init__()
         self.loop = loop
         self.title("DUSQ Charger BLE Test Tool")
-        self.geometry("820x680")
         self.resizable(True, True)
 
+        # Restore persisted UI state (window geometry, last device MAC,
+        # last-viewed tab).  Falls back to defaults on first run.
+        self._state = _load_state()
+        geom = self._state.get("geometry", "820x680")
+        try:
+            self.geometry(geom)
+        except Exception:
+            self.geometry("820x680")
+
         self.ble = BLEManager()
+        # Restore last-connected MAC + name so the Reconnect button is
+        # active immediately on launch.
+        last_mac = self._state.get("last_mac")
+        if last_mac:
+            self.ble.last_address = last_mac
+            self.ble.last_name    = self._state.get("last_name") or last_mac
 
         # Shared global event log — every BLE op + UI action lands here, and
         # the LogTab renders it. Wire to BLEManager so reads/writes/scans get
@@ -4085,6 +4619,13 @@ class App(tk.Tk):
                                     font=("Segoe UI", 10, "bold"),
                                     foreground="#c0392b")
         self.indicator.pack(side="right")
+        # Latency probe: when connected, pings Status char every 5 s and
+        # displays the round-trip time next to the indicator.  Colour
+        # threshold: green < 100 ms, yellow 100–300 ms, red > 300 ms.
+        self.latency_var = tk.StringVar(value="")
+        self.latency_lbl = ttk.Label(header, textvariable=self.latency_var,
+                                      font=("Segoe UI", 9))
+        self.latency_lbl.pack(side="right", padx=(0, 6))
         # When status_var changes anywhere in the app, recompute the
         # top-right indicator.
         self.status_var.trace_add("write", lambda *_: self._update_indicator())
@@ -4127,6 +4668,18 @@ class App(tk.Tk):
 
         # Tab order: workflow steps first, comprehensive validation,
         # then the activity log as the last tab.
+        # Auto-subscribe Haptic status when the user switches to that tab —
+        # the redesigned tab expects a live status indicator without a
+        # manual click.
+        def _on_tab_changed(_evt):
+            try:
+                current_tab = nb.nametowidget(nb.select())
+                if current_tab is self.hap_tab and hasattr(self.hap_tab, "_on_tab_visible"):
+                    self.hap_tab._on_tab_visible()
+            except Exception:
+                pass
+        nb.bind("<<NotebookTabChanged>>", _on_tab_changed)
+
         nb.add(self.conn_tab,    text="Connect")
         nb.add(self.adv_tab,     text="Adv Data")
         nb.add(self.auth_tab,    text="Auth")
@@ -4135,14 +4688,60 @@ class App(tk.Tk):
         nb.add(self.flash_tab,   text="Flash")
         nb.add(self.hap_tab,     text="Haptic")
         nb.add(self.batt_tab,    text="Battery")
-        nb.add(self.val_tab,     text="Validation")
+        nb.add(self.val_tab,     text="Automated Testing")
         nb.add(self.log_tab,     text="Log")
 
         # Initial state of the indicator + Reconnect button.
         self._update_indicator()
 
+        # Kick off the latency probe — fires every 5 s while connected.
+        self._latency_task: Optional[asyncio.Task] = None
+        self._start_latency_probe()
+
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_loop()
+
+    def _start_latency_probe(self):
+        """Schedule a periodic Status-char read every 5 s while connected.
+        Updates the header latency label with the round-trip time.
+        Uses a Tk after() loop (no asyncio task lifecycle to manage); the
+        actual BLE read is dispatched via run_async."""
+        async def _probe():
+            if not self.ble.connected:
+                return None
+            t0 = time.perf_counter()
+            try:
+                await self.ble.read(CHAR_STATUS)
+                return int((time.perf_counter() - t0) * 1000)
+            except Exception:
+                return None
+
+        def _on_done(task: asyncio.Task):
+            try:
+                rtt = task.result()
+            except Exception:
+                rtt = None
+            if rtt is None:
+                self.latency_var.set("")
+            else:
+                self.latency_var.set(f"· {rtt} ms")
+                if rtt < 100:
+                    self.latency_lbl.configure(foreground="#1b8c3a")  # green
+                elif rtt < 300:
+                    self.latency_lbl.configure(foreground="#d4a017")  # amber
+                else:
+                    self.latency_lbl.configure(foreground="#c0392b")  # red
+
+        def _tick():
+            if self.ble.connected:
+                task = run_async(_probe())
+                task.add_done_callback(
+                    lambda t: self.after(0, lambda: _on_done(t)))
+            else:
+                self.latency_var.set("")
+            self.after(5000, _tick)
+
+        self.after(5000, _tick)
 
     def _update_indicator(self):
         """Mirror the shared status string into the top-right indicator
@@ -4221,6 +4820,18 @@ class App(tk.Tk):
         self.after(20, self._poll_loop)
 
     def _on_close(self):
+        # Persist UI state for next launch — window geometry, last-connected
+        # device MAC, last-viewed tab.  Best-effort; never blocks shutdown.
+        try:
+            state = dict(self._state)
+            state["geometry"] = self.geometry()
+            if self.ble.last_address:
+                state["last_mac"]  = self.ble.last_address
+                state["last_name"] = self.ble.last_name or ""
+            _save_state(state)
+        except Exception:
+            pass
+
         self.adv_tab.stop()   # shut down passive scanner cleanly
         async def _cleanup():
             await self.ble.disconnect()
