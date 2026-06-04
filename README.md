@@ -845,5 +845,6 @@ anything that broke.
 5. **Debug fast-fill command** — write a uint8 N to a debug-only char
    and have firmware synthesise N blocks in seconds, so the validation
    suite's H1 wrap watcher can be deterministic instead of a 4-hour soak.
+6. things are solved now about the connection. 
 
 [↑ Back to index](#index)
