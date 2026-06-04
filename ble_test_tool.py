@@ -67,11 +67,12 @@ def _uuid(short: int) -> str:
 SVC_AUTH          = _uuid(0x1523)
 CHAR_AUTH_PIN     = _uuid(0x1524)   # Write + Notify — write 3-byte PIN {0,0,0}
 
-# Sensor Service (0x1525) — firmware exposes ONE merged 4-byte char.
-# Layout (little-endian): [temp:int8, db:uint8, lux:uint16]
-# Error markers: temp=127, db=0xFF, lux=0xFFFF.
+# Sensor Service (0x1525) — firmware exposes ONE merged 6-byte char.
+# Layout (little-endian): [temp:int16 tenths-degC, db:uint8, peak_db:uint8, lux:uint16]
+# Error markers: temp=0x7FFF (INT16_MAX), db=0xFF, lux=0xFFFF.
+# Flash records (152D) still carry temp as int8 degC; only this BLE-live char widened.
 SVC_SENSOR        = _uuid(0x1525)
-CHAR_SENSOR_DATA  = _uuid(0x1526)   # Read + Notify — 5-byte packed reading
+CHAR_SENSOR_DATA  = _uuid(0x1526)   # Read + Notify — 6-byte packed reading
 CHAR_STATUS       = _uuid(0x1529)   # Read + Notify — 10-byte packed status
 
 # Flash Data Service (0x152A) — sensor blocks AND journal share this service.
@@ -141,9 +142,35 @@ EVENT_TYPES = {
 }
 
 # Sensor error markers
-TEMP_ERROR          = 127
+TEMP_ERROR          = 127       # flash record (int8 degC)
+TEMP_ERROR_BLE      = 0x7FFF    # BLE live char (int16 tenths-degC)
 DB_ERROR            = 0xFF
 LUX_ERROR           = 0xFFFF
+
+
+def _decode_sensor_payload(data):
+    """Decode the merged sensor char (0x1526), tolerant to both payload layouts.
+
+    new firmware  6 B  <h B B H>  int16 LE temp (0.1 degC), db, peak_db, uint16 LE lux
+    old firmware  5 B  <b B B H>  int8 temp degC,           db, peak_db, uint16 LE lux
+
+    Returns (temp_c: Optional[float], db: Optional[int],
+             peak_db: Optional[int], lux: Optional[int]).
+    temp_c is None when the firmware reported the error sentinel; the other three
+    are None only when the payload is too short to decode (caller should drop).
+    """
+    if data is None:
+        return None, None, None, None
+    n = len(data)
+    if n >= 6:
+        temp_raw, db, peak_db, lux = struct.unpack_from("<hBBH", data)
+        temp_c = None if temp_raw == TEMP_ERROR_BLE else (temp_raw / 10.0)
+        return temp_c, db, peak_db, lux
+    if n >= 5:
+        temp_raw, db, peak_db, lux = struct.unpack_from("<bBBH", data)
+        temp_c = None if temp_raw == TEMP_ERROR else float(temp_raw)
+        return temp_c, db, peak_db, lux
+    return None, None, None, None
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Flash block decoder
@@ -821,6 +848,14 @@ class SensorTab(ttk.Frame):
             self.ax_lux  = fig.add_subplot(133)
             self.canvas  = FigureCanvasTkAgg(fig, master=cf)
             self.canvas.get_tk_widget().pack(fill="both", expand=True)
+            # Per-axes hover artifacts (faint horizontal line + left-edge value
+            # label).  Re-created on every _update_chart() because ax.clear()
+            # wipes them.
+            self._hover_artifacts = {}   # ax -> (Line2D, Text)
+            self._hover_fmt = {}         # ax -> str format spec
+            fig.canvas.mpl_connect("motion_notify_event", self._on_chart_hover)
+            fig.canvas.mpl_connect("axes_leave_event",    self._on_chart_leave)
+            fig.canvas.mpl_connect("figure_leave_event",  self._on_chart_leave)
             self._update_chart()
         else:
             lf = ttk.LabelFrame(self, text="Reading Log", padding=4)
@@ -857,7 +892,65 @@ class SensorTab(ttk.Frame):
         self.ax_lux.set_ylabel("lux")
         self.ax_lux.grid(True, alpha=0.4)
 
+        # Re-install hover artifacts (ax.clear() above removed the previous ones).
+        self._hover_artifacts.clear()
+        self._hover_fmt = {
+            self.ax_temp: "{:.1f}",
+            self.ax_db:   "{:.0f}",
+            self.ax_lux:  "{:.0f}",
+        }
+        for ax in (self.ax_temp, self.ax_db, self.ax_lux):
+            line = ax.axhline(0, color="#888", lw=0.6, alpha=0.35, visible=False,
+                              zorder=1)
+            label = ax.text(
+                0.015, 0.0, "",
+                transform=ax.get_yaxis_transform(),     # x in axes coords, y in data
+                ha="left", va="center",
+                fontsize=11, fontweight="bold", color="#222",
+                bbox=dict(boxstyle="round,pad=0.25",
+                          fc="white", ec="#888", alpha=0.85),
+                visible=False, zorder=5,
+            )
+            self._hover_artifacts[ax] = (line, label)
+
         self.canvas.draw_idle()
+
+    # ── hover crosshair ──────────────────────────────────────────────────────
+
+    def _on_chart_hover(self, event):
+        if not HAS_MPL or not self._hover_artifacts:
+            return
+        ax = event.inaxes
+        if ax is None or event.ydata is None or ax not in self._hover_artifacts:
+            self._on_chart_leave(event)
+            return
+        y = event.ydata
+        line, label = self._hover_artifacts[ax]
+        line.set_ydata([y, y])
+        line.set_visible(True)
+        label.set_position((0.015, y))
+        label.set_text(self._hover_fmt.get(ax, "{:.2f}").format(y))
+        label.set_visible(True)
+        # Hide artifacts on the other axes so only the hovered one shows.
+        for other_ax, (other_line, other_label) in self._hover_artifacts.items():
+            if other_ax is ax:
+                continue
+            if other_line.get_visible() or other_label.get_visible():
+                other_line.set_visible(False)
+                other_label.set_visible(False)
+        self.canvas.draw_idle()
+
+    def _on_chart_leave(self, _event):
+        if not HAS_MPL or not self._hover_artifacts:
+            return
+        dirty = False
+        for line, label in self._hover_artifacts.values():
+            if line.get_visible() or label.get_visible():
+                line.set_visible(False)
+                label.set_visible(False)
+                dirty = True
+        if dirty:
+            self.canvas.draw_idle()
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -915,12 +1008,14 @@ class SensorTab(ttk.Frame):
                 pass
 
     def _on_sensor(self, _h, data: bytearray):
-        """Single notify on the merged sensor char (0x1526), 5 bytes:
-           [int8 temp, uint8 db, uint8 peak_db, uint16 LE lux]."""
-        if len(data) < 5:
-            return
-        temp, db, peak_db, lux = struct.unpack_from("<bBBH", data)
-        self.sv_temp.set("ERR" if temp == TEMP_ERROR else str(temp))
+        """Merged sensor char (0x1526).  Two firmware payload layouts supported:
+           new (6 B):  <h B B H>  int16 LE temp (0.1 degC), db, peak_db, uint16 LE lux
+           old (5 B):  <b B B H>  int8 temp degC,           db, peak_db, uint16 LE lux
+        """
+        temp_c, db, peak_db, lux = _decode_sensor_payload(data)
+        if temp_c is None and (not data):
+            return  # truly empty packet
+        self.sv_temp.set("ERR" if temp_c is None else f"{temp_c:.1f}")
         self.sv_db.set("ERR" if db == DB_ERROR else str(db))
         self.sv_peak_db.set("ERR" if peak_db == DB_ERROR else str(peak_db))
         self.sv_lux.set("ERR" if lux == LUX_ERROR else str(lux))
@@ -943,13 +1038,22 @@ class SensorTab(ttk.Frame):
         if not self.ble.connected:
             messagebox.showwarning("Sensor", "Not connected.")
             return
+        # Re-entrancy guard: the awaits below take a few ms each, and during
+        # that window auto_subscribe() (on tab focus) or a second button click
+        # would also see self._subscribed == False and queue another _sub().
+        # That registered two start_notify callbacks on CHAR_SENSOR_DATA, so
+        # every notify pushed twice — visible as 2 points per 5 s on the chart.
+        # Flip the flag synchronously here; reset it in the failure path.
+        if self._subscribed:
+            return
+        self._subscribed = True
         async def _sub():
             try:
                 await self.ble.subscribe(CHAR_SENSOR_DATA, self._on_sensor)
                 await self.ble.subscribe(CHAR_BATT_LEVEL,  self._on_batt)
                 await self.ble.subscribe(CHAR_STATUS,      self._on_status)
-                self._subscribed = True
             except Exception as e:
+                self._subscribed = False
                 messagebox.showerror("Subscribe", str(e))
         run_async(_sub())
 
@@ -960,9 +1064,9 @@ class SensorTab(ttk.Frame):
         async def _read():
             try:
                 sensor_raw = await self.ble.read(CHAR_SENSOR_DATA)
-                if len(sensor_raw) >= 5:
-                    temp, db, peak_db, lux = struct.unpack_from("<bBBH", sensor_raw)
-                    self.sv_temp.set("ERR" if temp == TEMP_ERROR else str(temp))
+                temp_c, db, peak_db, lux = _decode_sensor_payload(sensor_raw)
+                if db is not None:
+                    self.sv_temp.set("ERR" if temp_c is None else f"{temp_c:.1f}")
                     self.sv_db.set("ERR" if db == DB_ERROR else str(db))
                     self.sv_peak_db.set("ERR" if peak_db == DB_ERROR else str(peak_db))
                     self.sv_lux.set("ERR" if lux == LUX_ERROR else str(lux))
@@ -2318,19 +2422,20 @@ class ValidationTab(ttk.Frame):
         evt = asyncio.Event()
 
         def _on_sensor(_h, data: bytearray):
-            if len(data) < 5:
-                return
-            temp, db, peak_db, lux = struct.unpack_from("<bBBH", data)
+            temp_c, db, peak_db, lux = _decode_sensor_payload(data)
+            if db is None:
+                return  # malformed / short packet
             entry = {
-                "temp":    None if temp == TEMP_ERROR else temp,
+                "temp":    temp_c,
                 "db":      None if db   == DB_ERROR   else db,
                 "peak_db": None if peak_db == DB_ERROR else peak_db,
                 "lux":     None if lux  == LUX_ERROR  else lux,
                 "ts":      time.time(),
             }
             ctx.samples.append(entry)
+            temp_disp = "None" if temp_c is None else f"{temp_c:.1f}"
             ctx.detail(f"  sample {len(ctx.samples)}/{n}: "
-                        f"t={entry['temp']}°C  db={entry['db']} "
+                        f"t={temp_disp}°C  db={entry['db']} "
                         f"(peak {entry['peak_db']})  "
                         f"lux={entry['lux']}")
             if len(ctx.samples) >= n:
@@ -5112,6 +5217,16 @@ class App(tk.Tk):
         # last-viewed tab).  Falls back to defaults on first run.
         self._state = _load_state()
         geom = self._state.get("geometry", "820x680")
+        # Drop saved +X+Y if the top-left falls outside the current screen
+        # (e.g. user disconnected the second monitor the window was last on).
+        # Tk would otherwise open the window invisibly off-screen.
+        import re as _re
+        _m = _re.match(r'^(\d+x\d+)([+-]\d+)([+-]\d+)$', geom)
+        if _m:
+            _x, _y = int(_m.group(2)), int(_m.group(3))
+            _sw, _sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            if not (-50 <= _x <= _sw - 100 and -50 <= _y <= _sh - 100):
+                geom = _m.group(1)   # keep WxH, drop the off-screen offset
         try:
             self.geometry(geom)
         except Exception:

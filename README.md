@@ -705,7 +705,7 @@ substitutes the short into the first 4 hex digits at advertising time.
 | Auth Service                  | 0x1523 | —              | —                                  |
 | └ Auth PIN                    | 0x1524 | W + N          | 3-byte PIN                         |
 | Sensor Service                | 0x1525 | —              | —                                  |
-| └ Sensor Data (merged)        | 0x1526 | R + N          | `<bBBH>` temp/db/peak/lux          |
+| └ Sensor Data (merged)        | 0x1526 | R + N          | 6 B `<hBBH>` temp(0.1°C i16)/db/peak/lux — tool also reads 5 B `<bBBH>` legacy (int8 °C) |
 | └ Status                      | 0x1529 | R + N          | 10-byte packed status              |
 | Flash Service                 | 0x152A | —              | —                                  |
 | └ Block count                 | 0x152B | R              | uint16 LE                          |
