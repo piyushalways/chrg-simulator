@@ -134,11 +134,31 @@ HEADER_CRC_RANGE    = HEADER_SIZE - 4  # = 28
 JOURNAL_ENTRY_SIZE  = 32
 JOURNAL_MAGIC       = 0xCAFEBABE
 EVENT_TYPES = {
-    0: "BOOT",          # data = boot_count
+    0: "BOOT",          # data = (reset_cause << 24) | boot_count[23:0]
     1: "TIME_SYNC",     # data = epoch (the value just received)
     2: "FLASH_WRAP",    # data = wrapped block sequence
     3: "ERROR",         # data = error code
     4: "LOW_BATTERY",   # data = batt percent
+}
+
+# BOOT entry: high byte of data = reset cause (firmware RESET_CAUSE_* in app_config.h)
+RESET_CAUSES = {
+    0: "power-on/brown-out",
+    1: "pin",
+    2: "watchdog",
+    3: "soft-reset",
+    4: "lockup",
+    5: "other",
+    6: "app-fault",
+}
+
+# EVENT_ERROR (fault record) low-16 = NRF_FAULT_ID_* (app_error.h / nrf_sdm.h).
+# Firmware packs the journal data as (info & 0xFFFF) << 16 | (id & 0xFFFF).
+FAULT_IDS = {
+    0x0001: "SoftDevice assert",
+    0x1001: "app memacc / hardfault",
+    0x4001: "SDK error (APP_ERROR_CHECK)",
+    0x4002: "SDK assert (ASSERT)",
 }
 
 # Sensor error markers
@@ -283,8 +303,11 @@ def decode_journal_entry(raw: bytes) -> Optional[dict]:
 
 def format_event_data(type_raw: int, data: int) -> str:
     """Human-readable interpretation of the JournalEntry data field."""
-    if type_raw == 0:   # BOOT
-        return f"boot_count = {data}"
+    if type_raw == 0:   # BOOT — data = (reset_cause << 24) | boot_count[23:0]
+        cause = (data >> 24) & 0xFF
+        boot_count = data & 0x00FFFFFF
+        cause_str = RESET_CAUSES.get(cause, f"unknown({cause})")
+        return f"boot #{boot_count}, reset = {cause_str}"
     if type_raw == 1:   # TIME_SYNC
         try:
             wall = datetime.fromtimestamp(data, tz=timezone.utc)
@@ -293,8 +316,11 @@ def format_event_data(type_raw: int, data: int) -> str:
             return f"epoch = {data} (out of range)"
     if type_raw == 2:   # FLASH_WRAP
         return f"wrap at block index = {data}"
-    if type_raw == 3:   # ERROR
-        return f"error code = 0x{data:08X}"
+    if type_raw == 3:   # ERROR — app-fault record: data = (info & 0xFFFF) << 16 | (id & 0xFFFF)
+        fault_id = data & 0xFFFF
+        info     = (data >> 16) & 0xFFFF
+        name     = FAULT_IDS.get(fault_id, f"id 0x{fault_id:04X}")
+        return f"fault: {name}  (id=0x{fault_id:04X}, info=0x{info:04X})"
     if type_raw == 4:   # LOW_BATTERY
         return f"battery = {data} %"
     return f"data = 0x{data:08X} ({data})"
@@ -1223,7 +1249,7 @@ class FlashTab(ttk.Frame):
             ("seq",       60,  "Seq",         "center"),
             ("type",      120, "Event",       "w"),
             ("timestamp", 100, "Timestamp",   "center"),
-            ("data",      140, "Data",        "w"),
+            ("data",      230, "Decoded",     "w"),
             ("crc",       60,  "CRC",         "center"),
         ]:
             self.jnl_tree.heading(col, text=hdr)
@@ -1476,7 +1502,7 @@ class FlashTab(ttk.Frame):
                     "", "end",
                     values=(self._jnl_connection_count,
                             e["sequence"], e["type_str"], e["timestamp"],
-                            f"0x{e['data']:08X} ({e['data']})",
+                            format_event_data(e["type_raw"], e["data"]),
                             "OK" if e["crc_ok"] else "FAIL"),
                     tags=(tag,) if tag else (),
                 )
