@@ -91,7 +91,14 @@ CHAR_BLOCK_COUNT     = _uuid(0x152B)   # Read — uint16 LE, unsynced sensor blo
 # Sensor record stream is W + N on the SAME char: subscribe first, then write
 # 0x01 — the device fires 152-byte block notifications on the same UUID.
 CHAR_RECORD          = _uuid(0x152D)
-CHAR_TIMESYNC        = _uuid(0x152E)   # Write — uint32 LE Unix epoch UTC
+CHAR_TIMESYNC        = _uuid(0x152E)   # Write — uint32 LE Unix epoch (IST wall-clock)
+
+# The device is timezone-agnostic: it stores whatever epoch we send and reports it
+# back verbatim (journal, advert last-sync, event log). We send India Standard Time
+# (UTC+05:30) so the device's wall clock — and every epoch it echoes — reads in IST.
+# Bias the host UTC epoch by +05:30 on send; render device epochs with tz=utc so the
+# already-biased value prints as the IST wall clock.
+IST_OFFSET_S = 5 * 3600 + 30 * 60   # +05:30
 
 # Journal characteristics (event log: BOOT / TIME_SYNC / FLASH_WRAP / ERROR / …)
 # Trigger and notify are on DIFFERENT chars: subscribe to RECORD, then write
@@ -121,7 +128,7 @@ CHAR_DIS_FW_REV         = "00002a26-0000-1000-8000-00805f9b34fb"
 CHAR_DIS_HW_REV         = "00002a27-0000-1000-8000-00805f9b34fb"
 CHAR_DIS_MANUFACTURER   = "00002a29-0000-1000-8000-00805f9b34fb"
 
-DEVICE_NAME       = "DUSQ_CHARGER"
+DEVICE_NAME       = "DUSQ-CHG"
 AUTH_PIN_LEN      = 3
 # Per-device PIN = low 24 bits of CRC32(UICR-backed Serial Number).
 # See src/ble_svc.c auth_init().  Use compute_auth_pin() to derive it from
@@ -320,8 +327,8 @@ def format_event_data(type_raw: int, data: int) -> str:
         return f"boot #{boot_count}, reset = {cause_str}"
     if type_raw == 1:   # TIME_SYNC
         try:
-            wall = datetime.fromtimestamp(data, tz=timezone.utc)
-            return f"epoch = {data}  ({wall:%Y-%m-%d %H:%M:%S} UTC)"
+            wall = datetime.fromtimestamp(data, tz=timezone.utc)   # epoch is IST-biased
+            return f"epoch = {data}  ({wall:%Y-%m-%d %H:%M:%S} IST)"
         except (OSError, OverflowError, ValueError):
             return f"epoch = {data} (out of range)"
     if type_raw == 2:   # FLASH_WRAP
@@ -610,7 +617,7 @@ class AuthTab(ttk.Frame):
         # successful sync write so the user sees confirmation but knows it's
         # still a one-shot action.  tk.Button (vs ttk) for reliable bg color
         # across Windows themes.
-        self.timesync_btn = tk.Button(frm, text="Send Time Sync (UTC)",
+        self.timesync_btn = tk.Button(frm, text="Send Time Sync (IST)",
                                        command=self._do_time_sync,
                                        bg="#c0392b", fg="white",
                                        activebackground="#a02818",
@@ -655,7 +662,7 @@ class AuthTab(ttk.Frame):
             self.timesync_btn.configure(
                 bg="#c0392b", fg="white",
                 activebackground="#a02818",
-                text="Send Time Sync (UTC)")
+                text="Send Time Sync (IST)")
             self.last_sync_var.set("Last sync: never")
         except Exception:
             pass
@@ -776,19 +783,19 @@ class AuthTab(ttk.Frame):
             self._log(f"Auth error: {e}")
 
     def _do_time_sync(self):
-        """Push the current UTC Unix epoch to CHAR_TIMESYNC.
+        """Push the current IST (UTC+05:30) wall-clock epoch to CHAR_TIMESYNC.
         Same logic as the Flash tab's Send Time Sync button — exposed here
         as well so users can sync immediately after authenticating without
         navigating away.  Updates the inline 'Last sync' label on success."""
         if not self.ble.connected:
             messagebox.showwarning("Time Sync", "Not connected.")
             return
-        epoch = int(time.time())
+        epoch = int(time.time()) + IST_OFFSET_S   # device runs on IST (UTC+05:30)
         async def _sync():
             try:
                 await self.ble.write(CHAR_TIMESYNC, struct.pack("<I", epoch))
-                wall = datetime.fromtimestamp(epoch, tz=timezone.utc)
-                self.last_sync_var.set(f"Last sync: {wall:%H:%M:%S} UTC")
+                wall = datetime.fromtimestamp(epoch, tz=timezone.utc)   # IST-biased -> renders IST
+                self.last_sync_var.set(f"Last sync: {wall:%H:%M:%S} IST")
                 # Flip the button to yellow/synced state — sync is one-shot,
                 # the yellow is a soft "confirmed" indicator (not green so the
                 # user knows they CAN re-sync without alarm).
@@ -800,7 +807,7 @@ class AuthTab(ttk.Frame):
                 except Exception:
                     pass
                 self._log(f"Time sync sent: epoch={epoch} "
-                          f"({wall:%Y-%m-%d %H:%M:%S} UTC)")
+                          f"({wall:%Y-%m-%d %H:%M:%S} IST)")
             except Exception as e:
                 self._log(f"Time sync error: {e}")
                 messagebox.showerror("Time Sync", str(e))
@@ -1084,13 +1091,35 @@ class SensorTab(ttk.Frame):
             return
         self._subscribed = True
         async def _sub():
-            try:
-                await self.ble.subscribe(CHAR_SENSOR_DATA, self._on_sensor)
-                await self.ble.subscribe(CHAR_BATT_LEVEL,  self._on_batt)
-                await self.ble.subscribe(CHAR_STATUS,      self._on_status)
-            except Exception as e:
+            # Subscribe to each char INDEPENDENTLY: a failure on one (e.g. a stale
+            # Windows GATT cache after re-flashing makes a char look non-notifiable)
+            # must not stop the others. Report exactly which char failed.
+            targets = (
+                ("Sensor Data (0x1526)", CHAR_SENSOR_DATA, self._on_sensor),
+                ("Battery (0x2A19)",     CHAR_BATT_LEVEL,  self._on_batt),
+                ("Status (0x1529)",      CHAR_STATUS,      self._on_status),
+            )
+            ok = 0
+            failed = []
+            for label, uuid, cb in targets:
+                try:
+                    await self.ble.subscribe(uuid, cb)
+                    ok += 1
+                except Exception as e:
+                    failed.append(f"  • {label}: {e}")
+            if ok == 0:
+                # Nothing subscribed — allow a retry (don't leave the guard set).
                 self._subscribed = False
-                messagebox.showerror("Subscribe", str(e))
+            if failed:
+                messagebox.showerror(
+                    "Subscribe",
+                    "Some characteristics could not be subscribed "
+                    f"({ok}/{len(targets)} succeeded):\n\n"
+                    + "\n".join(failed)
+                    + "\n\nAll three ARE notify-capable in firmware. If you just "
+                      "re-flashed, Windows is likely serving a STALE GATT cache — "
+                      "remove the device under Settings > Bluetooth (or toggle the "
+                      "adapter), then rescan.")
         run_async(_sub())
 
     def _do_read_once(self):
@@ -1319,14 +1348,14 @@ class FlashTab(ttk.Frame):
         if not self.ble.connected:
             messagebox.showwarning("Flash", "Not connected.")
             return
-        epoch = int(time.time())
+        epoch = int(time.time()) + IST_OFFSET_S   # device runs on IST (UTC+05:30)
         async def _sync():
             try:
                 await self.ble.write(CHAR_TIMESYNC, struct.pack("<I", epoch))
-                wall = datetime.fromtimestamp(epoch, tz=timezone.utc)
+                wall = datetime.fromtimestamp(epoch, tz=timezone.utc)   # IST-biased -> renders IST
                 messagebox.showinfo("Time Sync",
                                      f"Sent epoch {epoch} "
-                                     f"({wall:%Y-%m-%d %H:%M:%S} UTC)")
+                                     f"({wall:%Y-%m-%d %H:%M:%S} IST)")
             except Exception as e:
                 messagebox.showerror("Time Sync", str(e))
         run_async(_sync())
@@ -5077,23 +5106,21 @@ class AdvTab(ttk.Frame):
             self.scan_btn.configure(text="▶ Start scanning")
 
     def _on_adv(self, device, adv):
-        """Detection callback. Captures DUSQ targets always; non-DUSQ devices
-        only when Show-all is enabled (and then with decoded=None)."""
+        """Detection callback. Targets are matched by NAME only — company ID
+        0xFFFF is shared by many non-production devices, so a decodable MSD is
+        NOT a reliable filter (it matched foreign advertisers and decoded their
+        bytes as garbage). Non-DUSQ devices are captured only when Show-all is
+        enabled, with decoded=None."""
         name = (device.name or adv.local_name or "").strip() or "(no name)"
-        mfd = adv.manufacturer_data or {}
-        payload = mfd.get(ADV_MSD_COMPANY_ID)
-        decoded = decode_dusq_msd(payload) if payload else None
-
-        name_match = (name != "(no name)"
-                      and DEVICE_NAME.lower() in name.lower())
-        msd_match  = decoded is not None
-        is_target  = name_match or msd_match
+        is_target = (name != "(no name)" and "dusq" in name.lower())
         # Show-all gate: non-targets only enter the cache when enabled, so
         # toggling it off later just hides them without re-scanning.
         if not is_target and not self.show_all.get():
             return
-        # Track the device. We also stash whether it's a DUSQ target so the
-        # render path can colour the row + know whether to show decoded cols.
+        mfd = adv.manufacturer_data or {}
+        payload = mfd.get(ADV_MSD_COMPANY_ID)
+        # Decode only for our devices — a foreign 0xFFFF MSD would be garbage.
+        decoded = decode_dusq_msd(payload) if (payload and is_target) else None
         # Bleak occasionally publishes a new transient `device` instance for
         # the same address; we hold the latest reference for connect().
         self._devices[device.address] = {
