@@ -112,7 +112,7 @@ SVC_HAPTIC        = _uuid(0x152F)
 CHAR_HAPTIC_CTL      = _uuid(0x1530)   # Write — 0x01=ON, else OFF
 CHAR_HAPTIC_INT      = _uuid(0x1531)   # Read+Write — duty 0-100%
 CHAR_HAPTIC_TIMER    = _uuid(0x1532)   # Write — uint32 LE countdown seconds
-CHAR_HAPTIC_STAT     = _uuid(0x1533)   # Read+Notify — 0=idle,1=buzzing,2=countdown
+CHAR_HAPTIC_STAT     = _uuid(0x1533)   # Read+Notify — 10B: [0]state [1:5]next_fire_s LE [5]rem_en [6:10]recurring_s LE
 CHAR_HAPTIC_REMINDER = _uuid(0x1537)   # Read+Write — 5B: [0] enable, [1..4] recurring_s LE
 
 # Battery Service (SIG standard)
@@ -519,9 +519,17 @@ class BLEManager:
                 if not isinstance(device_or_addr, str) else None) or ""
         self._log(f"Connecting …")
         self._evt("connect", f"begin → {addr_str}")
+        # winrt use_cached_services=False -> BluetoothCacheMode.UNCACHED, forcing a
+        # fresh GATT discovery from the device on every connect. Without it, after
+        # re-flashing firmware that changed the GATT table, WinRT keeps serving a
+        # STALE cached table whose characteristics look like they have no CCCD, so
+        # every start_notify() fails with "characteristic does not support
+        # notifications or indications" even though reads/writes work fine. Ignored
+        # on BlueZ/macOS backends, so it is safe to pass unconditionally.
         self.client = BleakClient(device_or_addr,
                                   disconnected_callback=self._on_disconnect,
-                                  timeout=20.0)
+                                  timeout=20.0,
+                                  winrt={"use_cached_services": False})
         try:
             await self.client.connect(timeout=20.0)
         except Exception as e:
@@ -533,6 +541,22 @@ class BLEManager:
         self.last_name = name or self.last_name or ""
         self._log(f"Connected. MTU={self.client.mtu_size}")
         self._evt("connect", f"ok  MTU={self.client.mtu_size}  addr={addr_str}")
+        # DIAGNOSTIC: dump the properties bleak actually discovered for the
+        # notifiable chars. bleak raises "does not support notifications" from its
+        # OWN check of these .properties, so this tells us definitively whether
+        # 'notify' is present in what the OS handed us (missing -> stale OS GATT
+        # cache / discovery; present -> a CCCD/descriptor problem instead).
+        try:
+            watch = ("1526", "1529", "1533", "2a19", "152b", "152e")
+            for svc in (self.client.services or []):
+                for ch in svc.characteristics:
+                    short = ch.uuid.lower()[4:8]
+                    if short in watch:
+                        self._evt("gatt",
+                                  f"{short} props={sorted(ch.properties)} "
+                                  f"cccd={'yes' if any(d.uuid.lower()[4:8]=='2902' for d in ch.descriptors) else 'no'}")
+        except Exception as e:
+            self._evt("gatt", f"props dump failed: {e}")
         return True
 
     async def disconnect(self):
@@ -4280,18 +4304,40 @@ class HapticTab(ttk.Frame):
 
     def _sub_status(self):
         if not self.ble.connected: return
-        STATES = {0: "IDLE", 1: "BUZZING", 2: "COUNTDOWN"}
         def _on_stat(_h, data: bytearray):
-            v = data[0] if data else 0xFF
-            self.stat_var.set(STATES.get(v, f"?({v})"))
+            self.stat_var.set(self._decode_haptic_status(bytes(data)))
         async def _s():
             try:
                 await self.ble.subscribe(CHAR_HAPTIC_STAT, _on_stat)
                 self._subscribed = True
-                self._log("Subscribed to haptic status.")
+                # Explicit read so the current snapshot shows immediately (0x1533 is
+                # R+N) rather than waiting for the first transition notification.
+                try:
+                    raw = bytes(await self.ble.read(CHAR_HAPTIC_STAT))
+                    self.stat_var.set(self._decode_haptic_status(raw))
+                except Exception:
+                    pass
+                self._log("Subscribed to haptic status (+ read current).")
             except Exception as e:
                 self._log(f"Error: {e}")
         run_async(_s())
+
+    @staticmethod
+    def _decode_haptic_status(data: bytes) -> str:
+        """0x1533 snapshot: [0]state [1:5]next_fire_s LE [5]rem_en [6:10]recurring_s LE.
+        Falls back to the legacy 1-byte state for old firmware."""
+        STATES = {0: "IDLE", 1: "BUZZING", 2: "COUNTDOWN"}
+        if not data:
+            return "?(empty)"
+        st = STATES.get(data[0], f"?({data[0]})")
+        if len(data) >= 10:
+            next_s = struct.unpack("<I", data[1:5])[0]
+            rem_en = data[5]
+            recurring = struct.unpack("<I", data[6:10])[0]
+            nb = "none" if next_s == 0xFFFFFFFF else f"{next_s} s"
+            rem = f"ON (every {recurring} s)" if rem_en else "off"
+            return f"{st}  |  next buzz: {nb}  |  reminder: {rem}"
+        return st
 
     def _on_tab_visible(self):
         """Auto-subscribe to haptic status when the user switches to this tab,
@@ -5028,13 +5074,13 @@ class AdvTab(ttk.Frame):
             ("rssi",      "RSSI",         60),
             ("state",     "State",        110),
             ("usb",       "USB",          50),
-            ("charging",  "Charging",     70),
-            ("lid",       "Lid",          60),
+            ("charging",  "Boost EN",     70),
+            ("lid",       "Hall",         60),
             ("auth",      "Auth",         50),
             ("batt",      "Batt %",       60),
             ("blocks",    "Blocks",       60),
             ("journal",   "Journal",      60),
-            ("last_sync", "Last sync",    140),
+            ("last_sync", "Last flash sync", 140),
             ("next_buzz", "Next buzz",    90),
             ("ficr",      "FICR",         150),
             ("seen",      "Seen (s ago)", 80),
