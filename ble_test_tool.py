@@ -18,11 +18,15 @@ Usage:
 import asyncio
 import json
 import os
+import queue
+import re
 import struct
 import sys
+import threading
 import time
 import tkinter as tk
 import zlib
+from collections import deque
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +48,12 @@ try:
     HAS_MPL = True
 except ImportError:
     HAS_MPL = False
+
+try:
+    import pylink   # J-Link RTT reader (pip install pylink-square)
+    HAS_PYLINK = True
+except ImportError:
+    HAS_PYLINK = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  BLE UUID constants
@@ -4794,18 +4804,14 @@ class DeviceInfoTab(ttk.Frame):
 
     @staticmethod
     def _decode_system_id(raw: bytes) -> str:
-        """Decode the 8-byte SIG-standard System ID payload.
-            bytes 0..4  = 5 LSBs of manufacturer_id (= low 5 bytes of FICR.DEVICEID, little-endian)
-            bytes 5..7  = 3-byte organizationally_unique_id (Nordic OUI 0x00149F)"""
+        """Decode the 8-byte System ID = the full 64-bit FICR DEVICEID.
+            bytes 0..3 = DEVICEID[0] (LE), bytes 4..7 = DEVICEID[1] (LE).
+        Matches the FICR advertised in the scan-response MSD byte-for-byte."""
         if len(raw) < 8:
             return f"<short read: {raw.hex(' ').upper()}>"
-        mfg_bytes = raw[0:5]
-        oui_bytes = raw[5:8]
-        # Reassemble the original 64-bit manufacturer_id (only low 5 bytes used)
-        mfg_id = int.from_bytes(mfg_bytes, "little")
-        oui    = int.from_bytes(oui_bytes, "little")
-        return (f"mfg=0x{mfg_id:010X}  oui=0x{oui:06X}"
-                f"  ({raw.hex(' ').upper()})")
+        id0 = int.from_bytes(raw[0:4], "little")
+        id1 = int.from_bytes(raw[4:8], "little")
+        return f"FICR={id1:08X}{id0:08X}  ({raw.hex(' ').upper()})"
 
     def __init__(self, parent, ble: BLEManager):
         super().__init__(parent)
@@ -4889,11 +4895,14 @@ class DeviceInfoTab(ttk.Frame):
 # Manufacturer Specific Data layout (firmware: src/ble_svc.c build_manuf_data)
 #   [0]      sys_state (bits 0-3) | flags (bits 4-7: USB / boost / lid / auth)
 #   [1]      battery % (0..100, 0xFF if not yet read)
-#   [2-3]    unsynced block count, uint16 LE
-#   [4-5]    journal entry count, uint16 LE
-#   [6-9]    last sync Unix epoch, uint32 LE (0 = never since boot)
+#   [2]      unsynced block count, uint8 (0..234)
+#   [3]      journal entry count, uint8 (0..128)
+#   [4-7]    last sync Unix epoch, uint32 LE (0 = never)
+#   [8-11]   haptic next-buzz countdown, uint32 LE seconds (0xFFFFFFFF = none; coarse ~minute)
+#   [12-15]  FICR DEVICEID[0], uint32 LE
+#   [16-19]  FICR DEVICEID[1], uint32 LE
 ADV_MSD_COMPANY_ID = 0xFFFF
-ADV_MSD_LEN        = 10
+ADV_MSD_LEN        = 20
 ADV_STATE_NAMES = [
     "INIT", "SLOW_ADV", "FAST_ADV", "CONNECTED",
     "AUTHENTICATED", "FLASH_TX", "ERROR",
@@ -4901,23 +4910,39 @@ ADV_STATE_NAMES = [
 
 
 def decode_dusq_msd(payload):
-    """Decode the 10-byte DUSQ MSD payload (without company ID).
+    """Decode the 20-byte DUSQ MSD payload (without company ID).
     Returns dict, or None if payload is missing / too short."""
     if not payload or len(payload) < ADV_MSD_LEN:
         return None
     state_id = payload[0] & 0x0F
+    haptic = int.from_bytes(payload[8:12], "little")
+    ficr0  = int.from_bytes(payload[12:16], "little")
+    ficr1  = int.from_bytes(payload[16:20], "little")
     return {
-        "state_id":   state_id,
-        "state":      ADV_STATE_NAMES[state_id] if state_id < len(ADV_STATE_NAMES) else f"?({state_id})",
-        "usb":        bool(payload[0] & 0x10),
-        "charging":   bool(payload[0] & 0x20),
-        "lid_closed": bool(payload[0] & 0x40),
-        "authed":     bool(payload[0] & 0x80),
-        "batt_pct":   payload[1] if payload[1] != 0xFF else None,
-        "blocks":     int.from_bytes(payload[2:4], "little"),
-        "journal":    int.from_bytes(payload[4:6], "little"),
-        "last_sync":  int.from_bytes(payload[6:10], "little"),
+        "state_id":    state_id,
+        "state":       ADV_STATE_NAMES[state_id] if state_id < len(ADV_STATE_NAMES) else f"?({state_id})",
+        "usb":         bool(payload[0] & 0x10),
+        "charging":    bool(payload[0] & 0x20),
+        "lid_closed":  bool(payload[0] & 0x40),
+        "authed":      bool(payload[0] & 0x80),
+        "batt_pct":    payload[1] if payload[1] != 0xFF else None,
+        "blocks":      payload[2],
+        "journal":     payload[3],
+        "last_sync":   int.from_bytes(payload[4:8], "little"),
+        # Coarse (~minute) seconds until next buzz; 0xFFFFFFFF = none.
+        "haptic_secs": None if haptic == 0xFFFFFFFF else haptic,
+        # Full 64-bit FICR device ID (matches DIS System ID 0x2A23).
+        "ficr":        f"{ficr1:08X}{ficr0:08X}",
     }
+
+
+def fmt_next_buzz(secs):
+    """Format the coarse (minute-resolution) haptic countdown for display."""
+    if secs is None:
+        return "—"
+    if secs < 60:
+        return "<1 min"
+    return f"~{secs // 60} min"
 
 
 class AdvTab(ttk.Frame):
@@ -4964,7 +4989,8 @@ class AdvTab(ttk.Frame):
 
         # --- Device table ---------------------------------------------------
         cols = ("name", "address", "rssi", "state", "usb", "charging", "lid",
-                "auth", "batt", "blocks", "journal", "last_sync", "seen")
+                "auth", "batt", "blocks", "journal", "last_sync", "next_buzz",
+                "ficr", "seen")
         self.tree = ttk.Treeview(self, columns=cols, show="headings",
                                   selectmode="browse", height=12)
         for col, label, width in [
@@ -4980,6 +5006,8 @@ class AdvTab(ttk.Frame):
             ("blocks",    "Blocks",       60),
             ("journal",   "Journal",      60),
             ("last_sync", "Last sync",    140),
+            ("next_buzz", "Next buzz",    90),
+            ("ficr",      "FICR",         150),
             ("seen",      "Seen (s ago)", 80),
         ]:
             self.tree.heading(col, text=label)
@@ -5116,13 +5144,15 @@ class AdvTab(ttk.Frame):
                     d["blocks"],
                     d["journal"],
                     last_sync_disp,
+                    fmt_next_buzz(d["haptic_secs"]),
+                    d["ficr"],
                     f"{secs_ago}s",
                 )
             else:
                 # Either: DUSQ-named device without MSD payload (old firmware),
                 # or a non-DUSQ device shown in Show-all mode.
                 values = (name, addr, f"{info['rssi']} dBm",
-                          "—", "—", "—", "—", "—", "—", "—", "—", "—",
+                          "—", "—", "—", "—", "—", "—", "—", "—", "—", "—", "—",
                           f"{secs_ago}s")
             row_tags = ("target",) if info.get("is_target") else ()
             iid = self.tree.insert("", "end", values=values, tags=row_tags)
@@ -5232,6 +5262,441 @@ def _save_state(state: dict) -> None:
         pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  RTT flow monitor  (J-Link SWD, independent of the BLE link)
+#
+#  Reads NRF_LOG output from RTT channel 0 via pylink in a background thread,
+#  reconstructs the device flow from the [TAG] log messages, and flags anomalies
+#  (faults, watchdog resets, flash errors, auth failures, reset loops). Parsing
+#  is content-based on the message text, so it is robust to whatever NRF_LOG
+#  timestamp prefix precedes each line.
+# ─────────────────────────────────────────────────────────────────────────────
+
+RTT_TARGET_DEFAULT = "nRF52810_xxAA"   # J-Link device name passed to connect()
+_RESET_LOOP_N      = 3                  # this many resets...
+_RESET_LOOP_SECS   = 30                 # ...within this window -> flag a reset loop
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")   # strip CSI / colour codes
+
+
+def _strip_ansi(s: str) -> str:
+    return _ANSI_RE.sub("", s)
+
+
+# Severity — content-based, independent of NRF_LOG colouring.
+_SEV_ERROR = re.compile(
+    r"\[ERR\]|\[WDT\] Timeout|app fault|Fault id=|fstorage error|"
+    r"flash_wait timeout|erase failed|write failed|SAADC read failed|"
+    r"reset reason:\s*(?:app-fault|cpu-lockup)")
+_SEV_WARN = re.compile(
+    r"Auth FAIL|lockout|Boost blocked|reminder missed|CRC mismatch|bad magic|"
+    r"rejected|out of range|wrap:|CCCD not enabled|reset reason:\s*watchdog")
+
+_IDLE_SECS = 8   # a gap >= this between log bursts is shown as an idle/sleep row
+
+# Flow milestones — (regex, category, label template with named groups). First
+# match wins, so specific rules precede generic ones. Where an event is logged at
+# several layers ([TMR]->[SM]->[IO]/[BLE]) only the canonical line is a milestone.
+_FLOW_RULES = [
+    # boot / init
+    (re.compile(r"DUSQ Charger starting"),                  "boot",   "Firmware starting"),
+    (re.compile(r"reset reason:\s*(?P<cause>[\w/-]+)"),      "boot",   "Boot - reset = {cause}"),
+    (re.compile(r"no valid metadata"),                      "boot",   "Flash: fresh start (no metadata)"),
+    (re.compile(r"(?P<sub>\w+)\] Init complete"),           "init",   "{sub} init done"),
+    # advertising
+    (re.compile(r"-> SYS_SLOW_ADV|\[BLE\] Adv SLOW"),        "adv",    "Advertising (slow)"),
+    (re.compile(r"-> SYS_FAST_ADV|\[BLE\] Adv FAST"),        "adv",    "Advertising (fast)"),
+    # connection
+    (re.compile(r"\[SM\] BLE connected|\[BLE\] Connected"),  "conn",   "BLE connected"),
+    (re.compile(r"MTU updated:\s*(?P<m>\d+)"),               "conn",   "MTU = {m}"),
+    (re.compile(r"\[BLE\] Disconnected reason=(?P<r>0x[0-9a-fA-F]+)"), "conn", "BLE disconnected (reason {r})"),
+    # authentication
+    (re.compile(r"Auth OK"),                                 "auth",   "Authenticated"),
+    (re.compile(r"\[BLE\] Auth FAIL (?P<n>\d+)/(?P<k>\d+)"), "auth",   "Auth FAIL {n}/{k}"),
+    (re.compile(r"Auth lockout"),                            "auth",   "Auth lockout -> disconnect"),
+    (re.compile(r"\[SM\] Auth timeout"),                     "auth",   "Auth timeout -> disconnect"),
+    # physical I/O
+    (re.compile(r"\[SM\] Hall:\s*(?P<s>\w+)"),               "io",     "Lid {s}"),
+    (re.compile(r"\[SM\] USB:\s*(?P<s>\w+)"),                "io",     "USB {s}"),
+    (re.compile(r"\[BOOT\] Lid closed"),                     "io",     "Boot: lid closed -> BOOST ON"),
+    (re.compile(r"\[BOOT\] Lid open"),                       "io",     "Boot: lid open -> BOOST OFF"),
+    (re.compile(r"Boost blocked"),                           "io",     "Boost blocked (batt low)"),
+    (re.compile(r"\[IO\] BOOST (?P<s>\w+)"),                 "io",     "Boost {s}"),
+    # sensor cycle (all values) + battery
+    (re.compile(r"\[SM\] Sensor:\s*ts=(?P<ts>\d+)\s+temp=(?P<temp>-?\d+)\s+db=(?P<db>\d+)\s+peak_db=(?P<peak>\d+)\s+lux=(?P<lux>\d+)\s+batt=(?P<b>\d+)%"),
+                                                             "sensor", "Sensor t={ts}s: temp={temp} dB={db} peak={peak} lux={lux} batt={b}%"),
+    (re.compile(r"\[BATT\] code=.*batt=(?P<mv>\d+) mV"),     "sensor", "Battery {mv} mV"),
+    # haptic (specific before generic)
+    (re.compile(r"\[HAPTIC\] manual (?P<s>ON|OFF)"),         "haptic", "Haptic manual {s}"),
+    (re.compile(r"\[HAPTIC\] countdown START (?P<s>\d+)"),   "haptic", "Haptic countdown {s}s"),
+    (re.compile(r"\[HAPTIC\] cancelled"),                    "haptic", "Haptic cancelled"),
+    (re.compile(r"\[HAPTIC\] pattern done"),                 "haptic", "Haptic pattern done"),
+    (re.compile(r"\[HAPTIC\] reminder buzz"),               "haptic", "Reminder buzz"),
+    (re.compile(r"\[HAPTIC\] reminder chain -> next in (?P<s>\d+)"),   "haptic", "Reminder -> next {s}s"),
+    (re.compile(r"\[HAPTIC\] reminder resumed -> next in (?P<s>\d+)"), "haptic", "Reminder resumed -> next {s}s"),
+    (re.compile(r"\[HAPTIC\] reminder missed during reboot -> next in (?P<s>\d+)"), "haptic", "Reminder missed -> next {s}s"),
+    (re.compile(r"\[HAPTIC\] reminder loaded \(recurring=(?P<r>\d+)"), "haptic", "Reminder loaded ({r}s)"),
+    (re.compile(r"\[HAPTIC\] reminder (?P<s>\w+) \(recurring=(?P<r>\d+)"), "haptic", "Reminder {s} (recurring {r}s)"),
+    (re.compile(r"\[HAPTIC\] buzz (?P<x>\d+)/(?P<y>\d+) ON"), "haptic", "Haptic buzz {x}/{y}"),
+    # time sync
+    (re.compile(r"time synced: epoch=(?P<e>\d+)"),           "time",   "Time synced (epoch {e})"),
+    # flash / journal transfer
+    (re.compile(r"\[SM\] (?P<k>Flash|Journal) transfer (?P<a>start|done)"), "xfer", "{k} transfer {a}"),
+    (re.compile(r"wrap: sync jumped"),                       "xfer",   "Flash wrap (old blocks lost)"),
+    (re.compile(r"journal page erased .* lost=(?P<n>\d+)"),  "xfer",   "Journal page erased (lost {n})"),
+    # faults (also flagged in the anomaly pane)
+    (re.compile(r"\[ERR\] Fault"),                           "error",  "Fault -> reset"),
+    (re.compile(r"\[WDT\] Timeout"),                         "error",  "WDT timeout -> reset"),
+]
+# Raw-log only (NOT flow milestones): all [TMR] *, [FLASH] per-slot/meta/journal
+# internals, [SENS] PDM, [BLE] Stack init / Services registered, [AUTH] Expected
+# PIN / Derived, and the "---- init ----" start markers.
+
+# Anomalies — (regex, 'crit'|'warn', title, detail template; '_line' = full msg).
+_ANOMALY_RULES = [
+    (re.compile(r"\[BOOT\] app fault: id=(?P<id>0x[0-9a-fA-F]+).*?pc=(?P<pc>0x[0-9a-fA-F]+).*?info=(?P<info>0x[0-9a-fA-F]+)"),
+                                                     "crit", "App-fault reset (prior boot crashed)", "id={id} pc={pc} info={info}"),
+    (re.compile(r"\[ERR\] Fault id=(?P<id>0x[0-9a-fA-F]+).*?pc=(?P<pc>0x[0-9a-fA-F]+).*?info=(?P<info>0x[0-9a-fA-F]+)"),
+                                                     "crit", "Fault caught -> resetting", "id={id} pc={pc} info={info}"),
+    (re.compile(r"\[WDT\] Timeout"),                 "crit", "Watchdog timeout", "main loop stalled > 5 s"),
+    (re.compile(r"reset reason:\s*cpu-lockup"),      "crit", "CPU lockup reset", ""),
+    (re.compile(r"\[FLASH\].*?(?:failed|timeout)"),  "crit", "Flash operation failed", "{_line}"),
+    (re.compile(r"fstorage error"),                  "crit", "fstorage error", "{_line}"),
+    (re.compile(r"\[BATT\] SAADC read failed"),      "crit", "Battery ADC read failed", ""),
+    (re.compile(r"reset reason:\s*watchdog"),        "warn", "Watchdog reset", "device was reset by the WDT"),
+    (re.compile(r"\[BLE\] Auth FAIL"),               "warn", "Auth failure", "{_line}"),
+    (re.compile(r"\[BLE\] Auth lockout"),            "warn", "Auth lockout -> disconnect", ""),
+    (re.compile(r"\[SM\] Boost blocked"),            "warn", "Boost blocked (battery low)", "{_line}"),
+    (re.compile(r"\[HAPTIC\] reminder missed"),      "warn", "Reminder missed during reboot", ""),
+    (re.compile(r"\[FLASH\].*?(?:CRC mismatch|bad magic|out of range|wrap:)"), "warn", "Flash data warning", "{_line}"),
+    (re.compile(r"Reminder write rejected"),         "warn", "Reminder write rejected", "{_line}"),
+    (re.compile(r"CCCD not enabled"),                "warn", "CCCD not enabled", "{_line}"),
+]
+
+_RE_RESET = re.compile(r"reset reason:\s*[\w/-]+")
+
+
+@dataclass
+class RttEvent:
+    dt: datetime
+    sev: str                                    # 'error' | 'warn' | 'info'
+    text: str
+    flow: List[Tuple[str, str]]                 # [(category, label)] rows for this line
+    anomalies: List[Tuple[str, str, str]]       # [(sev, title, detail)]
+
+
+class FlowEngine:
+    """Per-line classification + reset-loop detection."""
+
+    def __init__(self):
+        self._boots = deque(maxlen=_RESET_LOOP_N)
+        self._last_flow = None
+        self._last_line_dt = None
+
+    @staticmethod
+    def _severity(text: str) -> str:
+        if _SEV_ERROR.search(text):
+            return "error"
+        if _SEV_WARN.search(text):
+            return "warn"
+        return "info"
+
+    @staticmethod
+    def _flow(text: str):
+        for rx, cat, tmpl in _FLOW_RULES:
+            m = rx.search(text)
+            if m:
+                try:
+                    return cat, tmpl.format(**m.groupdict())
+                except (KeyError, IndexError):
+                    return cat, tmpl
+        return None
+
+    def _anomalies(self, text: str, dt: datetime):
+        out = []
+        for rx, sev, title, tmpl in _ANOMALY_RULES:
+            m = rx.search(text)
+            if not m:
+                continue
+            fields = dict(m.groupdict())
+            fields["_line"] = text
+            try:
+                detail = tmpl.format(**fields)
+            except (KeyError, IndexError):
+                detail = text
+            if "id" in m.groupdict():   # decode the fault id if this rule captured one
+                try:
+                    fid = int(m.group("id"), 16) & 0xFFFF
+                    detail += f"  ({FAULT_IDS.get(fid, 'unknown fault')})"
+                except ValueError:
+                    pass
+            out.append((sev, title, detail))
+        if _RE_RESET.search(text):      # reset-loop detection
+            self._boots.append(dt)
+            if len(self._boots) >= _RESET_LOOP_N:
+                span = (self._boots[-1] - self._boots[0]).total_seconds()
+                if span <= _RESET_LOOP_SECS:
+                    out.append(("crit", "RESET LOOP",
+                                f"{len(self._boots)} resets in {span:.0f} s"))
+                    self._boots.clear()
+        return out
+
+    def feed(self, raw: str, dt: Optional[datetime] = None) -> Optional[RttEvent]:
+        dt = dt or datetime.now()
+        text = _strip_ansi(raw).strip()
+        if not text:
+            return None
+        flow_rows = []
+        # Idle/sleep marker: deferred RTT only flushes while the main loop runs,
+        # so a gap between log bursts ~ the System-ON sleep between events (sensor
+        # tick ~60 s, GPIOTE, BLE). PC-receive-time approximate, not exact.
+        if self._last_line_dt is not None:
+            gap = (dt - self._last_line_dt).total_seconds()
+            if gap >= _IDLE_SECS:
+                flow_rows.append(("idle", f"idle {gap:.0f}s (sleep)"))
+        self._last_line_dt = dt
+        item = self._flow(text)
+        if item is not None and item != self._last_flow:   # collapse back-to-back dups
+            self._last_flow = item
+            flow_rows.append(item)
+        return RttEvent(dt, self._severity(text), text,
+                        flow_rows, self._anomalies(text, dt))
+
+
+class RttReader(threading.Thread):
+    """Background J-Link RTT reader. Pushes (kind, payload) tuples onto a queue:
+    ('line', text) / ('status', text) / ('error', text)."""
+
+    def __init__(self, target: str, serial: str, out_q: "queue.Queue"):
+        super().__init__(daemon=True)
+        self.target = (target or RTT_TARGET_DEFAULT).strip()
+        self.serial = (serial or "").strip()
+        self.q = out_q
+        self._stop = threading.Event()
+        self._jlink = None
+
+    def stop(self):
+        self._stop.set()
+
+    def _emit(self, kind, payload):
+        self.q.put((kind, payload))
+
+    def run(self):
+        try:
+            jlink = pylink.JLink()
+            self._jlink = jlink
+            if self.serial:
+                jlink.open(serial_no=int(self.serial))
+            else:
+                jlink.open()
+            jlink.set_tif(pylink.enums.JLinkInterfaces.SWD)
+            self._emit("status", f"connecting to {self.target}...")
+            jlink.connect(self.target, speed="auto")
+            jlink.rtt_start(None)
+            self._emit("status", f"RTT connected ({self.target})")
+        except Exception as e:
+            self._emit("error", f"{type(e).__name__}: {e}")
+            self._close()
+            return
+
+        buf = b""
+        miss = 0
+        while not self._stop.is_set():
+            try:
+                data = self._jlink.rtt_read(0, 2048)
+            except Exception as e:
+                miss += 1
+                if miss > 50:          # control block never came up / link lost
+                    self._emit("error", f"rtt_read: {e}")
+                    break
+                time.sleep(0.05)
+                continue
+            if data:
+                miss = 0
+                buf += bytes(bytearray(data))
+                parts = buf.split(b"\n")
+                buf = parts.pop()          # keep the partial tail
+                for ln in parts:
+                    self._emit("line", ln.decode("latin-1", "replace").rstrip("\r"))
+            else:
+                time.sleep(0.02)
+        self._close()
+        self._emit("status", "stopped")
+
+    def _close(self):
+        try:
+            if self._jlink is not None:
+                try:
+                    self._jlink.rtt_stop()
+                except Exception:
+                    pass
+                self._jlink.close()
+        except Exception:
+            pass
+        self._jlink = None
+
+
+_FLOW_COLORS = {
+    "boot": "#eaf2ff", "adv": "#f3f0ff", "conn": "#e8f8f0", "auth": "#e6fbf2",
+    "sensor": "#fffbe6", "io": "#f0f4f8", "xfer": "#eef6ff", "haptic": "#fdeef6",
+    "init": "#f2f2f2", "time": "#e0f7f7", "error": "#fdecea", "idle": "#ededed",
+}
+
+
+class RttTab(ttk.Frame):
+    _MAX_RAW_LINES = 4000
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.engine = FlowEngine()
+        self.reader: Optional[RttReader] = None
+        self.q: "queue.Queue" = queue.Queue()
+        self._build()
+        self.after(200, self._poll)
+
+    def _build(self):
+        top = ttk.Frame(self)
+        top.pack(side="top", fill="x", padx=6, pady=4)
+        ttk.Label(top, text="Target:").pack(side="left")
+        self.target_var = tk.StringVar(value=RTT_TARGET_DEFAULT)
+        ttk.Entry(top, textvariable=self.target_var, width=15).pack(side="left", padx=(2, 8))
+        ttk.Label(top, text="J-Link S/N:").pack(side="left")
+        self.serial_var = tk.StringVar(value="")
+        ttk.Entry(top, textvariable=self.serial_var, width=11).pack(side="left", padx=(2, 8))
+        self.connect_btn = ttk.Button(top, text="Connect RTT", command=self._toggle)
+        self.connect_btn.pack(side="left", padx=2)
+        ttk.Button(top, text="Clear", command=self._clear).pack(side="left", padx=2)
+        ttk.Button(top, text="Save log...", command=self._save).pack(side="left", padx=2)
+        self.status_var = tk.StringVar(
+            value="idle" if HAS_PYLINK else "pylink-square not installed")
+        ttk.Label(top, textvariable=self.status_var, foreground="gray").pack(side="right")
+
+        outer = ttk.Panedwindow(self, orient="vertical")
+        outer.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        upper = ttk.Panedwindow(outer, orient="horizontal")
+        rawf = ttk.Labelframe(upper, text="Raw RTT log", padding=2)
+        self.raw = scrolledtext.ScrolledText(rawf, height=16, state="disabled",
+                                             font=("Consolas", 9), wrap="none")
+        self.raw.pack(fill="both", expand=True)
+        self.raw.tag_config("error", foreground="#c0392b")
+        self.raw.tag_config("warn", foreground="#d35400")
+
+        flowf = ttk.Labelframe(upper, text="Device flow", padding=2)
+        self.flow = ttk.Treeview(flowf, columns=("t", "evt"), show="headings", height=16)
+        self.flow.heading("t", text="Time")
+        self.flow.column("t", width=66, anchor="w", stretch=False)
+        self.flow.heading("evt", text="Event")
+        self.flow.column("evt", width=360, anchor="w")
+        self.flow.pack(fill="both", expand=True)
+        for cat, col in _FLOW_COLORS.items():
+            self.flow.tag_configure(cat, background=col)
+        upper.add(rawf, weight=3)
+        upper.add(flowf, weight=2)
+        outer.add(upper, weight=3)
+
+        anomf = ttk.Labelframe(outer, text="Flags / anomalies", padding=2)
+        self.anom = ttk.Treeview(anomf, columns=("t", "sev", "issue", "detail"),
+                                 show="headings", height=7)
+        for c, w, txt, st in [("t", 66, "Time", False), ("sev", 52, "Sev", False),
+                              ("issue", 210, "Issue", False), ("detail", 380, "Detail", True)]:
+            self.anom.heading(c, text=txt)
+            self.anom.column(c, width=w, anchor="w", stretch=st)
+        self.anom.pack(fill="both", expand=True)
+        self.anom.tag_configure("crit", foreground="#c0392b")
+        self.anom.tag_configure("warn", foreground="#d35400")
+        outer.add(anomf, weight=1)
+
+        if not HAS_PYLINK:
+            self.connect_btn.config(state="disabled")
+
+    # ── controls ──
+    def _toggle(self):
+        if self.reader and self.reader.is_alive():
+            self.stop()
+        else:
+            self._start()
+
+    def _start(self):
+        if not HAS_PYLINK:
+            messagebox.showerror("RTT", "pylink-square not installed:\n\n    pip install pylink-square")
+            return
+        self.reader = RttReader(self.target_var.get(), self.serial_var.get(), self.q)
+        self.reader.start()
+        self.connect_btn.config(text="Stop RTT")
+        self.status_var.set("connecting...")
+
+    def stop(self):
+        if self.reader:
+            self.reader.stop()
+        self.connect_btn.config(text="Connect RTT")
+
+    def _clear(self):
+        self.raw.config(state="normal")
+        self.raw.delete("1.0", "end")
+        self.raw.config(state="disabled")
+        self.flow.delete(*self.flow.get_children())
+        self.anom.delete(*self.anom.get_children())
+        self.engine = FlowEngine()
+
+    def _save(self):
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(defaultextension=".log",
+                                            filetypes=[("Log", "*.log"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.raw.get("1.0", "end"))
+            self.status_var.set(f"saved {os.path.basename(path)}")
+        except OSError as e:
+            messagebox.showerror("Save", str(e))
+
+    # ── pump (Tk main thread) ──
+    def _poll(self):
+        try:
+            for _ in range(1000):
+                kind, payload = self.q.get_nowait()
+                if kind == "line":
+                    self._on_line(payload)
+                elif kind == "status":
+                    self.status_var.set(payload)
+                elif kind == "error":
+                    self.status_var.set("error: " + payload)
+                    self._add_anom(datetime.now(), "crit", "RTT error", payload)
+                    self.connect_btn.config(text="Connect RTT")
+        except queue.Empty:
+            pass
+        self.after(120, self._poll)
+
+    def _on_line(self, raw: str):
+        ev = self.engine.feed(raw)
+        if ev is None:
+            return
+        tag = ev.sev if ev.sev in ("error", "warn") else ""
+        self.raw.config(state="normal")
+        self.raw.insert("end", ev.dt.strftime("%H:%M:%S ") + ev.text + "\n",
+                        (tag,) if tag else ())
+        line_count = int(self.raw.index("end-1c").split(".")[0])
+        if line_count > self._MAX_RAW_LINES:
+            self.raw.delete("1.0", f"{line_count - self._MAX_RAW_LINES}.0")
+        self.raw.see("end")
+        self.raw.config(state="disabled")
+
+        for cat, label in ev.flow:
+            iid = self.flow.insert("", "end",
+                                   values=(ev.dt.strftime("%H:%M:%S"), label), tags=(cat,))
+            self.flow.see(iid)
+        for sev, title, detail in ev.anomalies:
+            self._add_anom(ev.dt, sev, title, detail)
+
+    def _add_anom(self, dt: datetime, sev: str, title: str, detail: str):
+        iid = self.anom.insert("", "end",
+                               values=(dt.strftime("%H:%M:%S"), sev.upper(), title, detail),
+                               tags=(sev,))
+        self.anom.see(iid)
+
+
 class App(tk.Tk):
     def __init__(self, loop: asyncio.AbstractEventLoop):
         super().__init__()
@@ -5323,6 +5788,7 @@ class App(tk.Tk):
         self.batt_tab    = BatteryTab(nb, self.ble)
         self.val_tab     = ValidationTab(nb, self.ble)
         self.log_tab     = LogTab(nb, self.event_log)
+        self.rtt_tab     = RttTab(nb)
 
         # NOTE: Tab vertical scrollability removed — the canvas-wrap fought
         # Tk's geometry manager at App-init time (window unmapped, canvas
@@ -5374,6 +5840,7 @@ class App(tk.Tk):
         nb.add(self.batt_tab,    text="Battery")
         nb.add(self.val_tab,     text="Automated Testing")
         nb.add(self.log_tab,     text="Log")
+        nb.add(self.rtt_tab,     text="RTT / Flow")
 
         # Initial state of the indicator + Reconnect button.
         self._update_indicator()
@@ -5522,6 +5989,7 @@ class App(tk.Tk):
             pass
 
         self.adv_tab.stop()   # shut down passive scanner cleanly
+        self.rtt_tab.stop()   # stop the J-Link RTT reader thread
         async def _cleanup():
             await self.ble.disconnect()
         self.loop.run_until_complete(_cleanup())
