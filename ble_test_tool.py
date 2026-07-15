@@ -112,8 +112,8 @@ SVC_HAPTIC        = _uuid(0x152F)
 CHAR_HAPTIC_CTL      = _uuid(0x1530)   # Write — 0x01=ON, else OFF
 CHAR_HAPTIC_INT      = _uuid(0x1531)   # Read+Write — duty 0-100%
 CHAR_HAPTIC_TIMER    = _uuid(0x1532)   # Write — uint32 LE countdown seconds
-CHAR_HAPTIC_STAT     = _uuid(0x1533)   # Read+Notify — 10B: [0]state [1:5]next_fire_s LE [5]rem_en [6:10]recurring_s LE
-CHAR_HAPTIC_REMINDER = _uuid(0x1537)   # Read+Write — 5B: [0] enable, [1..4] recurring_s LE
+CHAR_HAPTIC_STAT     = _uuid(0x1533)   # Read+Notify — 12B: [0]motor_state [1]sched_type [2:6]next_fire_epoch LE [6:10]param LE [10]flags [11]rsvd
+CHAR_HAPTIC_REMINDER = _uuid(0x1537)   # Read+Write — 5B: [0]type (1=interval 2=daily 0=off) [1..4]param LE
 
 # Battery Service (SIG standard)
 SVC_BATT          = "0000180f-0000-1000-8000-00805f9b34fb"
@@ -4238,25 +4238,34 @@ class HapticTab(ttk.Frame):
         rem.pack(fill="x", padx=6, pady=6)
 
         ttk.Label(rem,
-                  text="Sets the post-buzz rescheduling rule. Bootstrap the chain by also writing a countdown above.",
-                  foreground="gray", wraplength=520
-                 ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
+                  text="Schedule (0x1537): INTERVAL every N s (bootstrap with a Countdown above) or DAILY at a wall-clock time (needs time-sync).",
+                  foreground="gray", wraplength=560
+                 ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 4))
 
-        ttk.Label(rem, text="Recurring (s):").grid(row=1, column=0, sticky="w")
-        self.rem_interval_var = tk.IntVar(value=86400)
+        ttk.Label(rem, text="Interval (s):").grid(row=1, column=0, sticky="w")
+        self.rem_interval_var = tk.IntVar(value=7200)
         ttk.Entry(rem, textvariable=self.rem_interval_var, width=10
                  ).grid(row=1, column=1, padx=4)
-        ttk.Button(rem, text="Arm",
-                   command=lambda: self._set_reminder(True)).grid(row=1, column=2, padx=4)
+        ttk.Button(rem, text="Arm Interval",
+                   command=self._set_interval).grid(row=1, column=2, padx=4)
         ttk.Button(rem, text="Disable",
-                   command=lambda: self._set_reminder(False)).grid(row=1, column=3, padx=4)
+                   command=self._disable_schedule).grid(row=1, column=3, padx=4)
         ttk.Button(rem, text="Read Current",
                    command=self._read_reminder).grid(row=1, column=4, padx=4)
 
-        ttk.Label(rem, text="Current rule:").grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(rem, text="Daily (HH:MM):").grid(row=2, column=0, sticky="w")
+        self.rem_daily_var = tk.StringVar(value="21:00")
+        ttk.Entry(rem, textvariable=self.rem_daily_var, width=10
+                 ).grid(row=2, column=1, padx=4)
+        ttk.Button(rem, text="Set Daily",
+                   command=self._set_daily).grid(row=2, column=2, padx=4)
+        ttk.Button(rem, text="STOP-ALL",
+                   command=lambda: self._write_ctl(0x02)).grid(row=2, column=3, padx=4)
+
+        ttk.Label(rem, text="Current:").grid(row=3, column=0, sticky="w", pady=4)
         self.rem_state_var = tk.StringVar(value="(unknown — click Read Current)")
         ttk.Label(rem, textvariable=self.rem_state_var,
-                  font=("Courier", 10)).grid(row=2, column=1, columnspan=4, sticky="w")
+                  font=("Courier", 10)).grid(row=3, column=1, columnspan=4, sticky="w")
 
         lf = ttk.LabelFrame(self, text="Log", padding=4)
         lf.pack(fill="both", expand=True, padx=6, pady=4)
@@ -4275,7 +4284,9 @@ class HapticTab(ttk.Frame):
         async def _w():
             try:
                 await self.ble.write(CHAR_HAPTIC_CTL, bytes([val]))
-                self._log(f"Motor {'ON' if val else 'OFF'}")
+                label = {0: "OFF / abort buzz", 1: "ON",
+                         2: "STOP-ALL (cancel every alarm + stop)"}.get(val, f"0x{val:02X}")
+                self._log(f"Control: {label}")
             except Exception as e:
                 self._log(f"Error: {e}")
         run_async(_w())
@@ -4324,20 +4335,31 @@ class HapticTab(ttk.Frame):
 
     @staticmethod
     def _decode_haptic_status(data: bytes) -> str:
-        """0x1533 snapshot: [0]state [1:5]next_fire_s LE [5]rem_en [6:10]recurring_s LE.
-        Falls back to the legacy 1-byte state for old firmware."""
-        STATES = {0: "IDLE", 1: "BUZZING", 2: "COUNTDOWN"}
+        """0x1533 snapshot (12 B): [0]motor_state [1]sched_type [2:6]next_fire_epoch LE
+        [6:10]repeat_param LE [10]flags(bit0 pending_sync) [11]rsvd."""
+        MOTOR = {0: "IDLE", 1: "BUZZING", 2: "COUNTDOWN"}
         if not data:
             return "?(empty)"
-        st = STATES.get(data[0], f"?({data[0]})")
-        if len(data) >= 10:
-            next_s = struct.unpack("<I", data[1:5])[0]
-            rem_en = data[5]
-            recurring = struct.unpack("<I", data[6:10])[0]
-            nb = "none" if next_s == 0xFFFFFFFF else f"{next_s} s"
-            rem = f"ON (every {recurring} s)" if rem_en else "off"
-            return f"{st}  |  next buzz: {nb}  |  reminder: {rem}"
-        return st
+        motor = MOTOR.get(data[0], f"?({data[0]})")
+        if len(data) >= 12:
+            stype   = data[1]
+            epoch   = struct.unpack("<I", data[2:6])[0]
+            param   = struct.unpack("<I", data[6:10])[0]
+            pending = bool(data[10] & 0x01)
+            if stype == 2:
+                sdesc = f"daily@{param // 3600:02d}:{(param % 3600) // 60:02d}"
+            elif stype == 1:
+                sdesc = f"interval {param}s"
+            else:
+                sdesc = "no schedule"
+            if pending:
+                nb = "pending time-sync"
+            elif epoch == 0:
+                nb = "—"
+            else:  # epoch is the app's-zone-biased epoch -> render as-is
+                nb = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+            return f"{motor}  |  {sdesc}  |  next: {nb}"
+        return motor
 
     def _on_tab_visible(self):
         """Auto-subscribe to haptic status when the user switches to this tab,
@@ -4352,50 +4374,61 @@ class HapticTab(ttk.Frame):
         """Reset subscribe flag so a reconnect + tab-revisit re-subscribes."""
         self._subscribed = False
 
-    def _set_reminder(self, enable: bool):
-        """Write the 5-byte Recurring Reminder rule (0x1537).
-
-        Wire format: [enable: u8] [recurring_s: u32 LE]
-        Firmware rejects enable=1 with recurring=0. Manual buzzes do not chain
-        — the phone must also write a countdown (0x1532) to bootstrap. """
-        if not self.ble.connected: return
-        interval = max(0, self.rem_interval_var.get())
-        if enable and interval <= 0:
-            messagebox.showerror("Reminder",
-                                 "Recurring interval must be > 0 when arming.")
-            return
-        payload = bytes([1 if enable else 0]) + struct.pack("<I", interval if enable else 0)
+    def _write_schedule(self, type_: int, param: int, label: str):
+        """0x1537 = [type u8][param u32 LE]. type 1=interval 2=daily 0=off."""
+        payload = bytes([type_]) + struct.pack("<I", param)
         async def _w():
             try:
                 await self.ble.write(CHAR_HAPTIC_REMINDER, payload)
-                if enable:
-                    self._log(f"Reminder ARMED: recurring={interval} s "
-                              f"({payload.hex(' ').upper()})")
-                    self._log("Now write a Countdown above to bootstrap the chain.")
-                else:
-                    self._log("Reminder DISABLED.")
-                self.rem_state_var.set(
-                    f"enable={int(enable)}  recurring={interval if enable else 0} s")
+                self._log(f"Schedule set: {label}  ({payload.hex(' ').upper()})")
+                self.rem_state_var.set(label)
             except Exception as e:
-                self._log(f"Reminder write error: {e}")
+                self._log(f"Schedule write error: {e}")
         run_async(_w())
 
+    def _set_interval(self):
+        if not self.ble.connected: return
+        secs = max(1, self.rem_interval_var.get())
+        self._write_schedule(1, secs, f"INTERVAL {secs}s (now write a Countdown to bootstrap)")
+
+    def _set_daily(self):
+        if not self.ble.connected: return
+        try:
+            hh, mm = self.rem_daily_var.get().strip().split(":")
+            tod = int(hh) * 3600 + int(mm) * 60
+            if not (0 <= tod < 86400):
+                raise ValueError
+        except Exception:
+            messagebox.showerror("Daily", "Enter time as HH:MM (00:00-23:59).")
+            return
+        self._write_schedule(2, tod, f"DAILY at {self.rem_daily_var.get()} (needs time-sync)")
+
+    def _disable_schedule(self):
+        if not self.ble.connected: return
+        self._write_schedule(0, 0, "DISABLED")
+
     def _read_reminder(self):
-        """Read the current 5-byte reminder rule (post-reboot reflects persisted state)."""
+        """Read the current schedule rule 0x1537 = [type][param] (post-reboot = persisted)."""
         if not self.ble.connected: return
         async def _r():
             try:
                 raw = bytes(await self.ble.read(CHAR_HAPTIC_REMINDER))
                 if len(raw) < 5:
-                    self._log(f"Reminder read: short ({len(raw)} bytes): {raw.hex(' ')}")
+                    self._log(f"Schedule read: short ({len(raw)} bytes): {raw.hex(' ')}")
                     return
-                enable = raw[0]
-                recurring_s = struct.unpack("<I", raw[1:5])[0]
-                state = f"enable={enable}  recurring={recurring_s} s"
+                type_ = raw[0]
+                param = struct.unpack("<I", raw[1:5])[0]
+                if type_ == 2:
+                    desc = f"daily at {param // 3600:02d}:{(param % 3600) // 60:02d}"
+                elif type_ == 1:
+                    desc = f"interval {param} s"
+                else:
+                    desc = "none"
+                state = f"type={type_}  ({desc})"
                 self.rem_state_var.set(state)
-                self._log(f"Reminder read: {raw.hex(' ').upper()}  →  {state}")
+                self._log(f"Schedule read: {raw.hex(' ').upper()}  ->  {state}")
             except Exception as e:
-                self._log(f"Reminder read error: {e}")
+                self._log(f"Schedule read error: {e}")
         run_async(_r())
 
 
