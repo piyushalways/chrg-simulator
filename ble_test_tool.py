@@ -112,8 +112,8 @@ SVC_HAPTIC        = _uuid(0x152F)
 CHAR_HAPTIC_CTL      = _uuid(0x1530)   # Write — 0x01=ON, else OFF
 CHAR_HAPTIC_INT      = _uuid(0x1531)   # Read+Write — duty 0-100%
 CHAR_HAPTIC_TIMER    = _uuid(0x1532)   # Write — uint32 LE countdown seconds
-CHAR_HAPTIC_STAT     = _uuid(0x1533)   # Read+Notify — 12B: [0]motor_state [1]sched_type [2:6]next_fire_epoch LE [6:10]param LE [10]flags [11]rsvd
-CHAR_HAPTIC_REMINDER = _uuid(0x1537)   # Read+Write — 5B: [0]type (1=interval 2=daily 0=off) [1..4]param LE
+CHAR_HAPTIC_STAT     = _uuid(0x1533)   # Read+Notify — 14B: [0]motor_state [1:5]single_shot LE [5:9]recurring LE [9:13]next_fire_epoch LE [13]flags
+CHAR_HAPTIC_REMINDER = _uuid(0x1537)   # Read+Write — 8B: [0:4]single_shot LE [4:8]recurring LE
 
 # Battery Service (SIG standard)
 SVC_BATT          = "0000180f-0000-1000-8000-00805f9b34fb"
@@ -4238,27 +4238,25 @@ class HapticTab(ttk.Frame):
         rem.pack(fill="x", padx=6, pady=6)
 
         ttk.Label(rem,
-                  text="Schedule (0x1537): INTERVAL every N s (bootstrap with a Countdown above) or DAILY at a wall-clock time (needs time-sync).",
-                  foreground="gray", wraplength=560
-                 ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 4))
+                  text="Schedule (0x1537) = [single_shot, recurring] s.  first fire = single_shot (or recurring if 0); recurring 0 = one-shot.  [0,3600]=every 1h · [<sec to 9PM>,86400]=daily · [0,0]=cancel.",
+                  foreground="gray", wraplength=580
+                 ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 4))
 
-        ttk.Label(rem, text="Interval (s):").grid(row=1, column=0, sticky="w")
-        self.rem_interval_var = tk.IntVar(value=7200)
-        ttk.Entry(rem, textvariable=self.rem_interval_var, width=10
+        ttk.Label(rem, text="single_shot (s):").grid(row=1, column=0, sticky="w")
+        self.rem_single_var = tk.IntVar(value=10)
+        ttk.Entry(rem, textvariable=self.rem_single_var, width=10
                  ).grid(row=1, column=1, padx=4)
-        ttk.Button(rem, text="Arm Interval",
-                   command=self._set_interval).grid(row=1, column=2, padx=4)
-        ttk.Button(rem, text="Disable",
-                   command=self._disable_schedule).grid(row=1, column=3, padx=4)
-        ttk.Button(rem, text="Read Current",
-                   command=self._read_reminder).grid(row=1, column=4, padx=4)
+        ttk.Label(rem, text="recurring (s):").grid(row=1, column=2, sticky="w")
+        self.rem_recurring_var = tk.IntVar(value=0)
+        ttk.Entry(rem, textvariable=self.rem_recurring_var, width=10
+                 ).grid(row=1, column=3, padx=4)
 
-        ttk.Label(rem, text="Daily (HH:MM):").grid(row=2, column=0, sticky="w")
-        self.rem_daily_var = tk.StringVar(value="21:00")
-        ttk.Entry(rem, textvariable=self.rem_daily_var, width=10
-                 ).grid(row=2, column=1, padx=4)
-        ttk.Button(rem, text="Set Daily",
-                   command=self._set_daily).grid(row=2, column=2, padx=4)
+        ttk.Button(rem, text="Set Schedule",
+                   command=self._set_schedule).grid(row=2, column=0, padx=4)
+        ttk.Button(rem, text="Disable",
+                   command=self._disable_schedule).grid(row=2, column=1, padx=4)
+        ttk.Button(rem, text="Read Current",
+                   command=self._read_reminder).grid(row=2, column=2, padx=4)
         ttk.Button(rem, text="STOP-ALL",
                    command=lambda: self._write_ctl(0x02)).grid(row=2, column=3, padx=4)
 
@@ -4335,27 +4333,22 @@ class HapticTab(ttk.Frame):
 
     @staticmethod
     def _decode_haptic_status(data: bytes) -> str:
-        """0x1533 snapshot (12 B): [0]motor_state [1]sched_type [2:6]next_fire_epoch LE
-        [6:10]repeat_param LE [10]flags(bit0 pending_sync) [11]rsvd."""
-        MOTOR = {0: "IDLE", 1: "BUZZING", 2: "COUNTDOWN"}
+        """0x1533 snapshot (14 B): [0]motor_state [1:5]single_shot LE [5:9]recurring LE
+        [9:13]next_fire_epoch LE [13]flags(bit0 pending_sync bit1 fire_pending)."""
+        MOTOR = {0: "IDLE", 1: "BUZZING"}
         if not data:
             return "?(empty)"
         motor = MOTOR.get(data[0], f"?({data[0]})")
-        if len(data) >= 12:
-            stype   = data[1]
-            epoch   = struct.unpack("<I", data[2:6])[0]
-            param   = struct.unpack("<I", data[6:10])[0]
-            pending = bool(data[10] & 0x01)   # daily waiting for time-sync
-            firing  = bool(data[10] & 0x02)   # a buzz is scheduled (epoch may be 0 if unsynced)
-            if stype == 2:
-                sdesc = f"daily@{param // 3600:02d}:{(param % 3600) // 60:02d}"
-            elif stype == 1:
-                sdesc = f"interval {param}s"
-            else:
-                sdesc = "no schedule"
+        if len(data) >= 14:
+            ss      = struct.unpack("<I", data[1:5])[0]
+            rec     = struct.unpack("<I", data[5:9])[0]
+            epoch   = struct.unpack("<I", data[9:13])[0]
+            pending = bool(data[13] & 0x01)   # held after reboot, waiting for sync
+            firing  = bool(data[13] & 0x02)   # a buzz is scheduled
+            sdesc = "no schedule" if (ss == 0 and rec == 0) else f"ss={ss}s rec={rec}s"
             if pending:
                 nb = "pending time-sync"
-            elif epoch != 0:  # epoch is the app's-zone-biased epoch -> render as-is
+            elif epoch != 0:  # app's-zone-biased epoch -> render as-is
                 nb = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%m-%d %H:%M:%S")
             elif firing:
                 nb = "scheduled (sync for exact time)"
@@ -4377,9 +4370,9 @@ class HapticTab(ttk.Frame):
         """Reset subscribe flag so a reconnect + tab-revisit re-subscribes."""
         self._subscribed = False
 
-    def _write_schedule(self, type_: int, param: int, label: str):
-        """0x1537 = [type u8][param u32 LE]. type 1=interval 2=daily 0=off."""
-        payload = bytes([type_]) + struct.pack("<I", param)
+    def _write_schedule(self, single_shot: int, recurring: int, label: str):
+        """0x1537 = [single_shot u32 LE][recurring u32 LE]."""
+        payload = struct.pack("<I", single_shot) + struct.pack("<I", recurring)
         async def _w():
             try:
                 await self.ble.write(CHAR_HAPTIC_REMINDER, payload)
@@ -4389,45 +4382,28 @@ class HapticTab(ttk.Frame):
                 self._log(f"Schedule write error: {e}")
         run_async(_w())
 
-    def _set_interval(self):
+    def _set_schedule(self):
         if not self.ble.connected: return
-        secs = max(1, self.rem_interval_var.get())
-        self._write_schedule(1, secs, f"INTERVAL {secs}s (now write a Countdown to bootstrap)")
-
-    def _set_daily(self):
-        if not self.ble.connected: return
-        try:
-            hh, mm = self.rem_daily_var.get().strip().split(":")
-            tod = int(hh) * 3600 + int(mm) * 60
-            if not (0 <= tod < 86400):
-                raise ValueError
-        except Exception:
-            messagebox.showerror("Daily", "Enter time as HH:MM (00:00-23:59).")
-            return
-        self._write_schedule(2, tod, f"DAILY at {self.rem_daily_var.get()} (needs time-sync)")
+        ss  = max(0, self.rem_single_var.get())
+        rec = max(0, self.rem_recurring_var.get())
+        self._write_schedule(ss, rec, f"single_shot={ss}s recurring={rec}s")
 
     def _disable_schedule(self):
         if not self.ble.connected: return
         self._write_schedule(0, 0, "DISABLED")
 
     def _read_reminder(self):
-        """Read the current schedule rule 0x1537 = [type][param] (post-reboot = persisted)."""
+        """Read the current schedule 0x1537 = [single_shot][recurring] (post-reboot = persisted)."""
         if not self.ble.connected: return
         async def _r():
             try:
                 raw = bytes(await self.ble.read(CHAR_HAPTIC_REMINDER))
-                if len(raw) < 5:
+                if len(raw) < 8:
                     self._log(f"Schedule read: short ({len(raw)} bytes): {raw.hex(' ')}")
                     return
-                type_ = raw[0]
-                param = struct.unpack("<I", raw[1:5])[0]
-                if type_ == 2:
-                    desc = f"daily at {param // 3600:02d}:{(param % 3600) // 60:02d}"
-                elif type_ == 1:
-                    desc = f"interval {param} s"
-                else:
-                    desc = "none"
-                state = f"type={type_}  ({desc})"
+                ss  = struct.unpack("<I", raw[0:4])[0]
+                rec = struct.unpack("<I", raw[4:8])[0]
+                state = f"single_shot={ss}s  recurring={rec}s"
                 self.rem_state_var.set(state)
                 self._log(f"Schedule read: {raw.hex(' ').upper()}  ->  {state}")
             except Exception as e:
@@ -5025,7 +5001,7 @@ def decode_dusq_msd(payload):
     Returns dict, or None if payload is missing / too short."""
     if not payload or len(payload) < ADV_MSD_LEN:
         return None
-    state_id = payload[0] & 0x0F
+    state_id = payload[0] & 0x07   # bits 0-2 (bit3 = haptic next-buzz epoch flag)
     haptic = int.from_bytes(payload[8:12], "little")
     ficr0  = int.from_bytes(payload[12:16], "little")
     ficr1  = int.from_bytes(payload[16:20], "little")
@@ -5040,20 +5016,26 @@ def decode_dusq_msd(payload):
         "blocks":      payload[2],
         "journal":     payload[3],
         "last_sync":   int.from_bytes(payload[4:8], "little"),
-        # Coarse (~minute) seconds until next buzz; 0xFFFFFFFF = none.
-        "haptic_secs": None if haptic == 0xFFFFFFFF else haptic,
+        # Next buzz: absolute epoch if [0] bit3 (synced), else coarse seconds; 0xFFFFFFFF = none.
+        "haptic_secs":     None if haptic == 0xFFFFFFFF else haptic,
+        "haptic_is_epoch": bool(payload[0] & 0x08),
         # Full 64-bit FICR device ID (matches DIS System ID 0x2A23).
         "ficr":        f"{ficr1:08X}{ficr0:08X}",
     }
 
 
-def fmt_next_buzz(secs):
-    """Format the coarse (minute-resolution) haptic countdown for display."""
-    if secs is None:
+def fmt_next_buzz(val, is_epoch=False):
+    """Format the advertised next-buzz: an absolute epoch (clock time) or coarse seconds."""
+    if val is None:
         return "—"
-    if secs < 60:
+    if is_epoch:
+        try:
+            return datetime.fromtimestamp(val, tz=timezone.utc).strftime("%m-%d %H:%M")
+        except Exception:
+            return f"epoch {val}"
+    if val < 60:
         return "<1 min"
-    return f"~{secs // 60} min"
+    return f"~{val // 60} min"
 
 
 class AdvTab(ttk.Frame):
@@ -5253,7 +5235,7 @@ class AdvTab(ttk.Frame):
                     d["blocks"],
                     d["journal"],
                     last_sync_disp,
-                    fmt_next_buzz(d["haptic_secs"]),
+                    fmt_next_buzz(d["haptic_secs"], d["haptic_is_epoch"]),
                     d["ficr"],
                     f"{secs_ago}s",
                 )
