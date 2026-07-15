@@ -4345,7 +4345,8 @@ class HapticTab(ttk.Frame):
             stype   = data[1]
             epoch   = struct.unpack("<I", data[2:6])[0]
             param   = struct.unpack("<I", data[6:10])[0]
-            pending = bool(data[10] & 0x01)
+            pending = bool(data[10] & 0x01)   # daily waiting for time-sync
+            firing  = bool(data[10] & 0x02)   # a buzz is scheduled (epoch may be 0 if unsynced)
             if stype == 2:
                 sdesc = f"daily@{param // 3600:02d}:{(param % 3600) // 60:02d}"
             elif stype == 1:
@@ -4354,10 +4355,12 @@ class HapticTab(ttk.Frame):
                 sdesc = "no schedule"
             if pending:
                 nb = "pending time-sync"
-            elif epoch == 0:
-                nb = "—"
-            else:  # epoch is the app's-zone-biased epoch -> render as-is
+            elif epoch != 0:  # epoch is the app's-zone-biased epoch -> render as-is
                 nb = datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+            elif firing:
+                nb = "scheduled (sync for exact time)"
+            else:
+                nb = "—"
             return f"{motor}  |  {sdesc}  |  next: {nb}"
         return motor
 
